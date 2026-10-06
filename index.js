@@ -6,7 +6,7 @@ const path = require('path');
 const { Client, LocalAuth, Poll } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { DateTime } = require('luxon');
-const { parsePhoneNumber } = require('libphonenumber-js');
+const { parsePhoneNumberFromString } = require('libphonenumber-js');
 
 // ================== Config (variables de entorno) ==================
 const BOT_NAME = process.env.BOT_NAME || 'Skibot';
@@ -59,6 +59,8 @@ const lastWelcomeAt = new Map(); // `${chatId}::${participantId}` -> ms
 const MIN_INTERVAL_MS = 1500;
 
 const cooldowns = new Map(); // `${sender}::${cmd}` -> ms
+
+const phoneCache = new Map(); // id serializado -> dígitos del teléfono real
 
 // ================== Sesión: limpiar locks de Chromium ==================
 // Tras un cierre sucio (docker kill / corte de luz) quedan estos archivos y
@@ -246,6 +248,34 @@ async function ensureParticipants(chat) {
   }
   return chat.participants || [];
 }
+
+// ---- Resolver número real (maneja @c.us y @lid) ----
+// En grupos WhatsApp puede identificar a los miembros como xxxx@lid; en ese caso
+// id.user NO es el teléfono, hay que pedir el contacto para obtener el número real.
+async function resolvePhoneDigits(id) {
+  const serialized = typeof id === 'string' ? id : id?._serialized;
+  if (!serialized) return '';
+  if (phoneCache.has(serialized)) return phoneCache.get(serialized);
+
+  let digits = '';
+  if (serialized.endsWith('@c.us')) {
+    digits = serialized.split('@')[0].replace(/\D/g, '');
+  } else {
+    const contact = await client.getContactById(serialized).catch(() => null);
+    const raw = contact?.number || (contact?.id?.server === 'c.us' ? contact.id.user : '');
+    digits = String(raw || '').replace(/\D/g, '');
+  }
+  if (digits) phoneCache.set(serialized, digits); // no cacheamos fallos
+  return digits;
+}
+
+function countryFromDigits(digits) {
+  if (!digits) return null;
+  try { return parsePhoneNumberFromString(`+${digits}`)?.country || null; }
+  catch (_) { return null; }
+}
+
+const cityName = zone => zone.split('/').pop().replace(/_/g, ' ');
 
 // ¿El remitente es admin del grupo? (coincidencia EXACTA por últimos 10 dígitos)
 async function isSenderAdminInGroup(chat, msg) {
@@ -469,23 +499,23 @@ client.on('message', async msg => {
 
           const targetChat = await safeCall(() => client.getChatById(target.id), 'getChatById (encuesta)');
 
-          // Resumen de horarios locales (según prefijo telefónico de los miembros)
+          // Resumen de horarios locales (según el país real de los miembros)
           const baseTime = DateTime.fromFormat(
             `${state.fecha} ${state.hora}`, 'dd/MM/yyyy HH:mm', { zone: 'America/Mexico_City' }
           );
           const zonasVistas = new Set();
           let tzSummary = '🕒 Horarios locales:\n';
-          for (const p of (targetChat ? await ensureParticipants(targetChat) : [])) {
-            try {
-              const country = parsePhoneNumber(`+${p.id.user}`).country;
-              if (country && countryTimezoneMap[country]) {
-                const { zone, flag } = countryTimezoneMap[country];
-                if (!zonasVistas.has(zone)) {
-                  zonasVistas.add(zone);
-                  tzSummary += `${flag} ${baseTime.setZone(zone).toFormat('HH:mm')}\n`;
-                }
+          const participants = targetChat ? await ensureParticipants(targetChat) : [];
+          const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id)));
+          for (const digits of phones) {
+            const country = countryFromDigits(digits);
+            if (country && countryTimezoneMap[country]) {
+              const { zone, flag } = countryTimezoneMap[country];
+              if (!zonasVistas.has(zone)) {
+                zonasVistas.add(zone);
+                tzSummary += `${flag} ${baseTime.setZone(zone).toFormat('HH:mm')}\n`;
               }
-            } catch (_) { /* número inválido */ }
+            }
           }
 
           const pollText =
@@ -577,8 +607,9 @@ client.on('message', async msg => {
    ➤ Comando: \`!discord gremio\`
 
 4. *Conversión Horaria para el Grupo* 🕒
-   ➤ Comando: \`Consultar hora HH:MM 🇲🇽\`
-   ➤ Ejemplo: \`Consultar hora 15:30 🇦🇷\`
+   ➤ Comando: \`Consultar hora HH:MM\`
+   ➤ Ejemplo: \`Consultar hora 15:30\`
+   ➤ Opcional: agrega una bandera para usar otra zona base, ej. \`Consultar hora 15:30 🇦🇷\`
 
 5. *Encuesta de Roles (solo admins)* 📊
    ➤ Comando: \`!encuesta roles\`
@@ -604,87 +635,86 @@ client.on('message', async msg => {
       return;
     }
 
-    // ============ Consultar hora (con bandera) ============
-    if (startsWithCmd(rawBody, ['consultar hora'])) {
+    // ============ Consultar hora ============
+    // Responde primero con la hora en la zona del remitente (o la bandera indicada)
+    // y debajo la conversión a los países de los demás miembros del grupo.
+    if (startsWithCmd(rawBody, ['consultar hora', '!consultar hora'])) { // con o sin !
       if (onCooldown(msg, 'hora')) return;
 
       const clean = rawBody.replace(/\u200B/g, '');
       const m = clean.match(/consultar hora\s+(\d{1,2}):(\d{2})\s*(.+)?/i);
       if (!m) {
-        return msg.reply('⛔ Usa el formato: *Consultar hora 20:00 🇲🇽*\nEjemplos:\n• *Consultar hora 20:00 🇲🇽*\n• *Consultar hora 20:00 🇦🇷*\n• *Consultar hora 20:00 🇺🇸*');
+        return msg.reply('⛔ Usa el formato: *Consultar hora 20:00*\n(opcional: agrega una bandera para usar otra zona base, ej. *Consultar hora 20:00 🇦🇷*)');
       }
 
       const hour = parseInt(m[1], 10);
       const minute = parseInt(m[2], 10);
-      const flagInput = m[3] ? m[3].trim() : '🇲🇽';
+      const flagInput = m[3] ? m[3].trim() : '';
 
       if (hour > 23 || minute > 59) {
         return msg.reply('⛔ Hora inválida. Usa formato 24h como *20:00* 🕒');
       }
 
-      let targetCountry = null;
-      let targetZone = 'America/Mexico_City';
-      let targetFlag = '🇲🇽';
+      // ---- 1) Zona base: bandera (si la pones) o país del remitente ----
+      let baseCode = null;
 
-      for (const [code, data] of Object.entries(countryTimezoneMap)) {
-        if (data.flag === flagInput) {
-          targetCountry = code; targetZone = data.zone; targetFlag = data.flag;
-          break;
-        }
-      }
-      if (!targetCountry && flagInput.length === 2) {
-        const code = flagInput.toUpperCase();
-        if (countryTimezoneMap[code]) {
-          targetCountry = code;
-          targetZone = countryTimezoneMap[code].zone;
-          targetFlag = countryTimezoneMap[code].flag;
-        }
-      }
-      if (!targetCountry) {
-        let banderas = '🚩 *Banderas disponibles:*\n';
+      if (flagInput) {
         for (const [code, data] of Object.entries(countryTimezoneMap)) {
-          banderas += `• ${data.flag} ${code} (${data.zone.split('/').pop().replace(/_/g, ' ')})\n`;
+          if (data.flag === flagInput || code === flagInput.toUpperCase()) { baseCode = code; break; }
         }
-        return msg.reply(`⛔ Bandera no reconocida: "${flagInput}"\n\n${banderas}\nEjemplo: *Consultar hora 20:00 🇲🇽*`);
+        if (!baseCode) {
+          let banderas = '🚩 *Banderas disponibles:*\n';
+          for (const [code, data] of Object.entries(countryTimezoneMap)) {
+            banderas += `• ${data.flag} ${code} (${cityName(data.zone)})\n`;
+          }
+          return msg.reply(`⛔ Bandera no reconocida: "${flagInput}"\n\n${banderas}`);
+        }
+      } else {
+        let digits = await resolvePhoneDigits(msg.author || msg.from);
+        if (!digits) {
+          const c = await msg.getContact().catch(() => null);
+          digits = String(c?.number || '').replace(/\D/g, '');
+        }
+        const c = countryFromDigits(digits);
+        baseCode = (c && countryTimezoneMap[c]) ? c : 'MX'; // fallback CDMX
+        console.log(`🕒 Zona base de ${who}: tel=${digits || '?'} → ${baseCode}`);
       }
 
-      const baseTime = DateTime.fromObject({ hour, minute }, { zone: targetZone });
-      let response = `🕓 *Hora base: ${baseTime.toFormat('HH:mm')} (${targetZone.split('/').pop().replace(/_/g, ' ')})* ${targetFlag}\n\n`;
+      const base = countryTimezoneMap[baseCode];
+      const baseTime = DateTime.fromObject({ hour, minute }, { zone: base.zone });
 
-      const paisesYaIncluidos = new Set([targetCountry]);
-      let conversiones = 0;
+      let response =
+        `🕓 *Tu hora: ${baseTime.toFormat('HH:mm')}* ${base.flag} (${cityName(base.zone)})\n`;
 
-      // Solo en grupos hay participantes que consultar
-      let participants = [];
+      // ---- 2) Conversión a los países de los demás miembros ----
       if (isGroupMsg) {
         const chat = await safeCall(() => msg.getChat(), 'getChat (hora)', 2);
-        participants = chat ? await ensureParticipants(chat) : [];
-      }
-      for (const participant of participants) {
-        const rawNumber = participant.id?.user || participant.number || '';
-        if (!rawNumber) continue;
-        try {
-          const iso = parsePhoneNumber(`+${rawNumber}`).country;
-          if (!iso || paisesYaIncluidos.has(iso) || !countryTimezoneMap[iso]) continue;
-          paisesYaIncluidos.add(iso);
-          conversiones++;
+        const participants = chat ? await ensureParticipants(chat) : [];
+
+        const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id)));
+        const seen = new Set([baseCode]);
+        const lines = [];
+
+        phones.forEach(digits => {
+          const iso = countryFromDigits(digits);
+          if (!iso || seen.has(iso) || !countryTimezoneMap[iso]) return;
+          seen.add(iso);
 
           const tz = countryTimezoneMap[iso];
           const local = baseTime.setZone(tz.zone);
-          let cambioDia = '';
-          if (local.day > baseTime.day) cambioDia = ' (día siguiente)';
-          if (local.day < baseTime.day) cambioDia = ' (día anterior)';
-          response += `${tz.flag} ${iso}: ${local.toFormat('HH:mm')} (${tz.zone.split('/').pop().replace(/_/g, ' ')})${cambioDia}\n`;
-        } catch (_) { /* número inválido */ }
+          const diff = local.startOf('day').diff(baseTime.startOf('day'), 'days').days; // sin depender de local.day
+          const cambioDia = diff > 0 ? ' (día siguiente)' : diff < 0 ? ' (día anterior)' : '';
+          lines.push(`${tz.flag} *${local.toFormat('HH:mm')}* – ${cityName(tz.zone)}${cambioDia}`);
+        });
+
+        console.log(`🕒 Participantes: ${participants.length}, con teléfono resuelto: ${phones.filter(Boolean).length}, zonas: ${lines.length}`);
+
+        response += lines.length
+          ? `\n🌎 *Conversión para el grupo:*\n${lines.join('\n')}`
+          : '\nℹ️ No se detectaron miembros de otros países en el grupo.';
+      } else {
+        response += '\nℹ️ Usa este comando en un grupo para ver la conversión de sus miembros.';
       }
-
-      if (!conversiones) response += 'ℹ️ No se detectaron participantes de otros países en el grupo.';
-
-      response += '\n\n🚩 *Banderas disponibles:* ';
-      Object.values(countryTimezoneMap).forEach((d, i) => {
-        if (i % 5 === 0 && i > 0) response += '\n';
-        response += `${d.flag} `;
-      });
 
       return msg.reply(response);
     }
