@@ -60,9 +60,41 @@ function cleanSingletonLocks() {
   for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
     try { fs.rmSync(path.join(dir, f), { force: true }); } catch (_) { /* noop */ }
   }
+  // Carpetas temporales donde Chromium deja su socket de instancia
+  try {
+    for (const name of fs.readdirSync('/tmp')) {
+      if (name.startsWith('.org.chromium.') || name.startsWith('.com.google.Chrome.')) {
+        fs.rmSync(path.join('/tmp', name), { recursive: true, force: true });
+      }
+    }
+  } catch (_) { /* noop */ }
+}
+
+// Al arrancar, cualquier Chromium vivo en ESTE contenedor es huérfano (el nuestro
+// aún no se lanzó): lo matamos para que no bloquee el perfil.
+function killStaleChromium() {
+  if (process.platform !== 'linux') return;
+  let killed = 0;
+  try {
+    for (const name of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(name)) continue;
+      const pid = Number(name);
+      if (pid === process.pid || pid === process.ppid || pid === 1) continue;
+      try {
+        const exe = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[0] || '';
+        if (/chrom(e|ium)/i.test(exe)) { process.kill(pid, 'SIGKILL'); killed++; }
+      } catch (_) { /* proceso ya terminó */ }
+    }
+  } catch (_) { /* noop */ }
+  if (killed) console.log(`🧹 Chromium huérfano eliminado (${killed} procesos)`);
+}
+
+function prepareProfile() {
+  killStaleChromium();
+  cleanSingletonLocks();
 }
 fs.mkdirSync(SESSION_PATH, { recursive: true });
-cleanSingletonLocks();
+prepareProfile();
 
 // ================== Cliente ==================
 const client = new Client({
@@ -702,43 +734,21 @@ client.on('group_update', async notification => {
 
 // ================== Init ==================
 console.log(`🚀 Iniciando ${BOT_NAME}...`);
-client.initialize().catch(err => {
-  console.error('❌ Error al inicializar el cliente:', err);
-  shutdown(1);
-});
-// Si alguien sale, limpiamos su marca para que un reingreso inmediato VUELVA a saludar.
-async function handleLeave(notification) {
-  try {
-    const chat = await notification.getChat();
-    const chatKey = chat.id?._serialized || String(chat.id);
-    for (const participantId of collectIds(notification)) {
-      lastWelcomeAt.delete(welcomeKey(chatKey, participantId));
+(async function initClient() {
+  const MAX_TRIES = 3;
+  for (let i = 1; i <= MAX_TRIES; i++) {
+    try {
+      await client.initialize();
+      return;
+    } catch (err) {
+      console.error(`❌ Error al inicializar el cliente (intento ${i}/${MAX_TRIES}): ${shortErr(err)}`);
+      if (i === MAX_TRIES) break;
+      try { await client.destroy(); } catch (_) { /* noop */ }
+      prepareProfile();
+      await sleep(3000 * i);
     }
-  } catch (e) {
-    console.log('ℹ️ handleLeave error/noop:', e?.message || e);
   }
-}
-
-client.on('group_join', handleWelcome);
-client.on('group_leave', handleLeave);
-
-// Fallback para forks/Comunidades que usan group_update
-client.on('group_update', async notification => {
-  try {
-    const t = (notification?.type || '').toString().toLowerCase();
-    if (['add', 'invite', 'link_join', 'participant_added', 'participants_added'].includes(t)) {
-      await handleWelcome(notification);
-    }
-    if (['remove', 'participant_removed', 'participants_removed', 'left'].includes(t)) {
-      await handleLeave(notification);
-    }
-  } catch (_) { /* noop */ }
-});
-
-// ================== Init ==================
-console.log(`🚀 Iniciando ${BOT_NAME}...`);
-client.initialize().catch(err => {
-  console.error('❌ Error al inicializar el cliente:', err);
+  // Pausa antes de salir: evita un bucle de reinicios ultrarrápido
+  await sleep(15000);
   shutdown(1);
-});
-
+})();
