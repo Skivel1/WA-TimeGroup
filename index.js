@@ -980,7 +980,7 @@ async function handleWelcome(notification) {
         `🎉 *¡Bienvenid@* ${tag} *a esta pequeña familia!* 🫂✨\n\n` +
         `🎮 Déjanos tu *nick* y las *líneas que juegas* 🧙‍♂️🏹🛡️\n\n` +
         `💳 Por si las dudas, también deja tu número de tarjeta de crédito, CVV y órganos sanos, por favor 😌🫀🫁😂\n\n` +
-        `¡Disfruta tu estadía en *Warrior Guardian*! 🔥`;
+        `¡Disfruta tu estadía en *The Abyss*! 🔥`;
 
       await client.sendMessage(chatKey, bienvenida, { mentions: contact ? [contact] : [] });
       console.log(`✅ Bienvenida enviada a ${contact?.pushname || contact?.number || participantId}`);
