@@ -22,6 +22,10 @@ const botStartTime = new Date();
 
 // Número del owner: últimos 10 dígitos SIN +52 ni prefijos
 const OWNER_NUMBER_BASE10 = toBase10(process.env.OWNER_NUMBER || '');
+// Admins fijos opcionales (no dependen de WhatsApp Web): ADMIN_NUMBERS=8111111111,8222222222
+const ADMIN_NUMBERS = new Set(
+  (process.env.ADMIN_NUMBERS || '').split(',').map(toBase10).filter(x => x.length >= 7)
+);
 if (!OWNER_NUMBER_BASE10) {
   console.warn('⚠️ OWNER_NUMBER no está definido: nadie tendrá permisos de owner.');
 }
@@ -232,24 +236,57 @@ async function isSenderAdminInGroup(chat, msg) {
   return senderBases.some(b => adminSet.has(b));
 }
 
-// ¿Es el owner? Chequeo barato primero; solo si el id es @lid consulta el contacto.
-async function isOwner(msg) {
-  if (!OWNER_NUMBER_BASE10) return false;
+// ¿El remitente coincide con alguno de estos números? Chequeo barato primero;
+// solo si el id es @lid consulta el contacto.
+async function senderMatches(msg, numbers) {
+  if (!numbers.size) return false;
   const candidates = [msg.author, msg.from].filter(Boolean);
-  if (candidates.some(c => extractUserBase10(c) === OWNER_NUMBER_BASE10)) return true;
+  if (candidates.some(c => numbers.has(extractUserBase10(c)))) return true;
   if (candidates.some(c => String(c).endsWith('@lid'))) {
     const contact = await msg.getContact().catch(() => null);
-    if (contact?.number && toBase10(contact.number) === OWNER_NUMBER_BASE10) return true;
+    if (contact?.number && numbers.has(toBase10(contact.number))) return true;
   }
   return false;
 }
+const OWNER_SET = new Set(OWNER_NUMBER_BASE10 ? [OWNER_NUMBER_BASE10] : []);
+const STAFF_SET = new Set([...OWNER_SET, ...ADMIN_NUMBERS]);
+const isOwner = msg => senderMatches(msg, OWNER_SET);
 
-async function canRunAdminCmd(msg, isGroupMsg) {
-  if (await isOwner(msg)) return true;
-  if (!isGroupMsg) return false;
-  const chat = await msg.getChat();
-  return isSenderAdminInGroup(chat, msg);
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+const shortErr = e => String((e && (e.message || e)) || 'error desconocido').split('\n')[0].slice(0, 200);
+
+// WhatsApp Web a veces rechaza getChat/getChatById (sobre todo justo después de
+// vincular, mientras sincroniza). Reintenta y, si no se puede, devuelve null.
+async function safeCall(fn, label, tries = 3) {
+  for (let i = 1; i <= tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (i === tries) {
+        console.error(`⚠️ ${label} falló tras ${tries} intentos: ${shortErr(e)}`);
+        return null;
+      }
+      await sleep(1500 * i);
+    }
+  }
+  return null;
 }
+
+// true = puede, false = no puede, null = no se pudo verificar (error de WhatsApp Web)
+async function canRunAdminCmd(msg, isGroupMsg) {
+  if (await senderMatches(msg, STAFF_SET)) return true; // owner o ADMIN_NUMBERS
+  if (!isGroupMsg) return false;
+  const chat = await safeCall(() => msg.getChat(), 'getChat (permisos)');
+  if (!chat) return null;
+  try {
+    return await isSenderAdminInGroup(chat, msg);
+  } catch (e) {
+    console.error('⚠️ Verificación de admin falló:', shortErr(e));
+    return null;
+  }
+}
+
+const MSG_NO_VERIFY = '⚠️ No pude verificar tus permisos en este momento. Intenta de nuevo en un minuto.';
 
 // Matching de comandos (case/acentos/espacios)
 function normCmd(s) {
@@ -359,7 +396,7 @@ client.on('message', async msg => {
             : state.groups.find(g => normCmd(g.name) === normCmd(text));
           if (!target) return msg.reply('⛔ No encontré ese grupo. Responde con número o nombre exacto.');
 
-          const targetChat = await client.getChatById(target.id);
+          const targetChat = await safeCall(() => client.getChatById(target.id), 'getChatById (encuesta)');
 
           // Resumen de horarios locales (según prefijo telefónico de los miembros)
           const baseTime = DateTime.fromFormat(
@@ -367,7 +404,7 @@ client.on('message', async msg => {
           );
           const zonasVistas = new Set();
           let tzSummary = '🕒 Horarios locales:\n';
-          for (const p of await ensureParticipants(targetChat)) {
+          for (const p of (targetChat ? await ensureParticipants(targetChat) : [])) {
             try {
               const country = parsePhoneNumber(`+${p.id.user}`).country;
               if (country && countryTimezoneMap[country]) {
@@ -412,7 +449,9 @@ client.on('message', async msg => {
 
     // ============ !skibot (admins/owner) ============
     if (isCmd(rawBody, ['!skibot'])) {
-      if (!(await canRunAdminCmd(msg, isGroupMsg))) return;
+      const ok = await canRunAdminCmd(msg, isGroupMsg);
+      if (ok === null) return msg.reply(MSG_NO_VERIFY);
+      if (!ok) return;
       const now = new Date();
       const horaLocal = now.toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
       await msg.reply(
@@ -427,8 +466,9 @@ client.on('message', async msg => {
 
     // ============ !encuesta roles (admins/owner) ============
     if (isCmd(rawBody, ['!encuesta roles'])) {
-      if (!(await canRunAdminCmd(msg, isGroupMsg))) return;
-      const chat = await msg.getChat();
+      const ok = await canRunAdminCmd(msg, isGroupMsg);
+      if (ok === null) return msg.reply(MSG_NO_VERIFY);
+      if (!ok) return;
       const title = '🎮 *¿Qué línea juegas más frecuentemente?*';
       const options = [
         '🗡️ Top – El reino del 1v1 eterno.',
@@ -439,9 +479,9 @@ client.on('message', async msg => {
       ];
       try {
         if (typeof Poll === 'function') {
-          await chat.sendMessage(new Poll(title, options, { allowMultipleAnswers: true }));
+          await client.sendMessage(msg.from, new Poll(title, options, { allowMultipleAnswers: true }));
         } else {
-          await chat.sendMessage(title + '\n\n' + options.map((o, i) => `${i + 1}. ${o}`).join('\n'));
+          await client.sendMessage(msg.from, title + '\n\n' + options.map((o, i) => `${i + 1}. ${o}`).join('\n'));
         }
         console.log(`📊 Encuesta de roles enviada por ${who}`);
       } catch (err) {
@@ -544,7 +584,11 @@ client.on('message', async msg => {
       let conversiones = 0;
 
       // Solo en grupos hay participantes que consultar
-      const participants = isGroupMsg ? await ensureParticipants(await msg.getChat()) : [];
+      let participants = [];
+      if (isGroupMsg) {
+        const chat = await safeCall(() => msg.getChat(), 'getChat (hora)', 2);
+        participants = chat ? await ensureParticipants(chat) : [];
+      }
       for (const participant of participants) {
         const rawNumber = participant.id?.user || participant.number || '';
         if (!rawNumber) continue;
@@ -574,7 +618,7 @@ client.on('message', async msg => {
       return msg.reply(response);
     }
   } catch (err) {
-    console.error('❌ Error general en message handler:', err);
+    console.error('❌ Error en message handler:', shortErr(err), '\n', String(err && err.stack || '').split('\n').slice(1, 4).join('\n'));
   }
 });
 
@@ -591,8 +635,8 @@ function collectIds(notification) {
 
 async function handleWelcome(notification) {
   try {
-    const chat = await notification.getChat();
-    const chatKey = chat.id?._serialized || String(chat.id);
+    const chatKey = notification.chatId || notification.id?.remote;
+    if (!chatKey) return;
     const joinedIds = collectIds(notification);
     if (!joinedIds.length) return;
 
@@ -619,7 +663,7 @@ async function handleWelcome(notification) {
         `💳 Por si las dudas, también deja tu número de tarjeta de crédito, CVV y órganos sanos, por favor 😌🫀🫁😂\n\n` +
         `¡Disfruta tu estadía en *Warrior Guardian*! 🔥`;
 
-      await chat.sendMessage(bienvenida, { mentions: contact ? [contact] : [] });
+      await client.sendMessage(chatKey, bienvenida, { mentions: contact ? [contact] : [] });
       console.log(`✅ Bienvenida enviada a ${contact?.pushname || contact?.number || participantId}`);
     }
   } catch (error) {
@@ -627,6 +671,41 @@ async function handleWelcome(notification) {
   }
 }
 
+// Si alguien sale, limpiamos su marca para que un reingreso inmediato VUELVA a saludar.
+async function handleLeave(notification) {
+  try {
+    const chatKey = notification.chatId || notification.id?.remote;
+    if (!chatKey) return;
+    for (const participantId of collectIds(notification)) {
+      lastWelcomeAt.delete(welcomeKey(chatKey, participantId));
+    }
+  } catch (e) {
+    console.log('ℹ️ handleLeave error/noop:', e?.message || e);
+  }
+}
+
+client.on('group_join', handleWelcome);
+client.on('group_leave', handleLeave);
+
+// Fallback para forks/Comunidades que usan group_update
+client.on('group_update', async notification => {
+  try {
+    const t = (notification?.type || '').toString().toLowerCase();
+    if (['add', 'invite', 'link_join', 'participant_added', 'participants_added'].includes(t)) {
+      await handleWelcome(notification);
+    }
+    if (['remove', 'participant_removed', 'participants_removed', 'left'].includes(t)) {
+      await handleLeave(notification);
+    }
+  } catch (_) { /* noop */ }
+});
+
+// ================== Init ==================
+console.log(`🚀 Iniciando ${BOT_NAME}...`);
+client.initialize().catch(err => {
+  console.error('❌ Error al inicializar el cliente:', err);
+  shutdown(1);
+});
 // Si alguien sale, limpiamos su marca para que un reingreso inmediato VUELVA a saludar.
 async function handleLeave(notification) {
   try {
