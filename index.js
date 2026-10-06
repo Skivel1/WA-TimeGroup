@@ -15,7 +15,7 @@ const SESSION_PATH = path.join(DATA_DIR, '.wwebjs_auth');
 const CACHE_PATH = path.join(DATA_DIR, '.wwebjs_cache');
 const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE || '/tmp/skibot-heartbeat';
 const LOG_MESSAGES = process.env.LOG_MESSAGES === 'true'; // loguear T// Reemplaza esto con tu número de WhatsApp registrado (con código de país sin el signo +)
-const MY_NUMBER = '52181XXXXXXXX@c.us'; // O el formato de tu ID de WhatsApp (ej. 521... o 52...)
+const MY_NUMBER = '528121581206@c.us'; // O el formato de tu ID de WhatsApp (ej. 521... o 52...)
 
 async function canRunAdminCmd(msg) {
   // 1. Si el mensaje viene de tu número personal, autorizar de inmediato
