@@ -1,7 +1,6 @@
 services:
   skibot:
     build: .
-    pull_policy: build       # <-- AGREGA ESTA LÍNEA
     image: skibot:latest
     container_name: skibot
     restart: unless-stopped
@@ -10,6 +9,11 @@ services:
     stop_grace_period: 20s   # tiempo para cerrar Chromium limpiamente
     environment:
       - OWNER_NUMBER=${OWNER_NUMBER}
+      - ADMIN_NUMBERS=${ADMIN_NUMBERS:-}
+      - OWNER_IDS=${OWNER_IDS:-}
+      - PUBLIC_COMMANDS=${PUBLIC_COMMANDS:-false}
+      - ALLOW_GROUP_ADMINS=${ALLOW_GROUP_ADMINS:-true}
+      - ADMIN_IDS=${ADMIN_IDS:-}
       - BOT_NAME=${BOT_NAME:-Skibot}
       - TZ=${TZ:-America/Mexico_City}
       - LOG_MESSAGES=${LOG_MESSAGES:-false}
