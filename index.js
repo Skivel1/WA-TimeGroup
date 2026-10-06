@@ -257,14 +257,43 @@ async function resolvePhoneDigits(id) {
   if (!serialized) return '';
   if (phoneCache.has(serialized)) return phoneCache.get(serialized);
 
+  const onlyDigits = v => String(v || '').split('@')[0].replace(/\D/g, '');
   let digits = '';
+
   if (serialized.endsWith('@c.us')) {
-    digits = serialized.split('@')[0].replace(/\D/g, '');
+    digits = onlyDigits(serialized);
+  } else if (serialized.endsWith('@lid')) {
+    // 1) API de whatsapp-web.js (versiones recientes): LID -> número real
+    if (typeof client.getContactLidAndPhone === 'function') {
+      try {
+        const r = await client.getContactLidAndPhone([serialized]);
+        const pn = Array.isArray(r) ? r[0]?.pn : null;
+        if (pn) digits = onlyDigits(pn);
+      } catch (_) { /* noop */ }
+    }
+    // 2) Fallback: Store interno de WhatsApp Web
+    if (!digits && client.pupPage) {
+      try {
+        const pn = await client.pupPage.evaluate(lid => {
+          const wid = window.Store.WidFactory.createWid(lid);
+          const p = window.Store.LidUtils?.getPhoneNumber?.(wid);
+          return p ? p._serialized || String(p) : null;
+        }, serialized);
+        if (pn) digits = onlyDigits(pn);
+      } catch (_) { /* noop */ }
+    }
+    // 3) Último recurso: el contacto, SOLO si trae un número distinto del LID
+    if (!digits) {
+      const contact = await client.getContactById(serialized).catch(() => null);
+      if (contact?.id?.server === 'c.us') digits = onlyDigits(contact.id.user);
+      else if (contact?.number && onlyDigits(contact.number) !== onlyDigits(serialized)) {
+        digits = onlyDigits(contact.number);
+      }
+    }
   } else {
-    const contact = await client.getContactById(serialized).catch(() => null);
-    const raw = contact?.number || (contact?.id?.server === 'c.us' ? contact.id.user : '');
-    digits = String(raw || '').replace(/\D/g, '');
+    digits = onlyDigits(serialized);
   }
+
   if (digits) phoneCache.set(serialized, digits); // no cacheamos fallos
   return digits;
 }
@@ -692,6 +721,10 @@ client.on('message', async msg => {
         const participants = chat ? await ensureParticipants(chat) : [];
 
         const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id)));
+        participants.forEach((p, i) => {
+          const d = phones[i];
+          console.log(`   👤 ${p.id?._serialized || '?'} → tel=${d || '❌ sin resolver'} → país=${countryFromDigits(d) || '?'}`);
+        });
         const seen = new Set([baseCode]);
         const lines = [];
 
