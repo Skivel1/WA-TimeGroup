@@ -62,6 +62,17 @@ const cooldowns = new Map(); // `${sender}::${cmd}` -> ms
 
 const phoneCache = new Map(); // id serializado -> dígitos del teléfono real
 
+// Respaldo cuando WhatsApp Web no deja leer los miembros del grupo:
+// recordamos a quienes escriben / entran. chatId -> Set(ids)
+const groupSeen = new Map();
+const GROUP_SEEN_MAX = 1024;
+function rememberMember(chatId, id) {
+  if (!chatId || !id) return;
+  let set = groupSeen.get(chatId);
+  if (!set) { set = new Set(); groupSeen.set(chatId, set); }
+  if (set.size < GROUP_SEEN_MAX) set.add(String(id));
+}
+
 // ================== Sesión: limpiar locks de Chromium ==================
 // Tras un cierre sucio (docker kill / corte de luz) quedan estos archivos y
 // Chromium se niega a abrir el perfil ("browser is already running").
@@ -141,9 +152,15 @@ client.on('qr', qr => {
 });
 
 let watchdogTimer = null;
-client.on('ready', () => {
+client.on('ready', async () => {
   console.log('✅ Bot listo para funcionar');
   beat();
+  try {
+    const webVer = await client.getWWebVersion();
+    let libVer = '?';
+    try { libVer = require('whatsapp-web.js/package.json').version; } catch (_) { /* noop */ }
+    console.log(`ℹ️ whatsapp-web.js ${libVer} | WhatsApp Web ${webVer}`);
+  } catch (_) { /* noop */ }
   if (watchdogTimer) return;
   watchdogTimer = setInterval(async () => {
     try {
@@ -308,6 +325,7 @@ async function getGroupMembers(chatId) {
   if (client.pupPage) {
     try {
       const list = await client.pupPage.evaluate(async id => {
+        if (!window.Store || !window.Store.WidFactory) return null; // Store no inyectado
         const wid = window.Store.WidFactory.createWid(id);
         let meta = window.Store.GroupMetadata?.get?.(wid) || window.Store.Chat?.get?.(wid)?.groupMetadata;
         if (!meta && window.Store.GroupMetadata?.find) meta = await window.Store.GroupMetadata.find(wid);
@@ -328,6 +346,12 @@ async function getGroupMembers(chatId) {
   if (chat) {
     const parts = await ensureParticipants(chat);
     return parts.map(p => ({ id: p.id?._serialized, pn: null })).filter(p => p.id);
+  }
+  // 3) Respaldo: miembros que hemos visto escribir o entrar a este grupo
+  const seen = groupSeen.get(chatId);
+  if (seen && seen.size) {
+    console.warn(`⚠️ Usando miembros vistos (${seen.size}) porque WhatsApp Web no permite leer el grupo. Actualiza whatsapp-web.js.`);
+    return [...seen].map(id => ({ id, pn: null }));
   }
   return [];
 }
@@ -481,6 +505,9 @@ client.on('message', async msg => {
     const inFlow = !isGroupMsg && encuestaState.has(msg.from);
 
     if (LOG_MESSAGES) console.log(`📥 [${new Date().toLocaleString()}] ${senderLabel(msg)} | ID: ${msg.author || msg.from} | ${msg.from}: "${rawBody}"`);
+
+    // Recordar quién habla en el grupo (barato, sin tocar el navegador)
+    if (isGroupMsg && msg.author) rememberMember(msg.from, msg.author);
 
     // El 95% de los mensajes de grupo termina aquí
     if (!inFlow && !COMMAND_START.test(normCmd(rawBody))) return;
@@ -810,6 +837,7 @@ async function handleWelcome(notification) {
       const now = Date.now();
       if (now - (lastWelcomeAt.get(key) || 0) < MIN_INTERVAL_MS) continue;
       lastWelcomeAt.set(key, now); // marcar ANTES de await evita dobles por carrera
+      rememberMember(chatKey, participantId);
 
       let contact = null;
       try {
