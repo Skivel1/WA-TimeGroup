@@ -14,30 +14,7 @@ const DATA_DIR = process.env.DATA_DIR || '.';
 const SESSION_PATH = path.join(DATA_DIR, '.wwebjs_auth');
 const CACHE_PATH = path.join(DATA_DIR, '.wwebjs_cache');
 const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE || '/tmp/skibot-heartbeat';
-const LOG_MESSAGES = process.env.LOG_MESSAGES === 'true'; // loguear T// Reemplaza esto con tu número de WhatsApp registrado (con código de país sin el signo +)
-const MY_NUMBER = '528121581206@c.us'; // O el formato de tu ID de WhatsApp (ej. 521... o 52...)
-
-async function canRunAdminCmd(msg) {
-  // 1. Si el mensaje viene de tu número personal, autorizar de inmediato
-  const senderId = msg.author || msg.from;
-  if (senderId === MY_NUMBER || senderId.includes('528121581206')) {
-    return true;
-  }
-
-  // 2. Validación estándar de administradores en el grupo
-  try {
-    const chat = await msg.getChat();
-    if (!chat.isGroup) return false;
-
-    const authorId = msg.author || msg.from;
-    const participant = chat.participants.find(p => p.id._serialized === authorId);
-
-    return participant && (participant.isAdmin || participant.isSuperAdmin);
-  } catch (error) {
-    console.error("Error al consultar administradores del chat:", error.message);
-    return false;
-  }
-}ODOS los mensajes (debug)
+const LOG_MESSAGES = process.env.LOG_MESSAGES === 'true'; // loguear TODOS los mensajes (debug)
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 3000);
 const WATCHDOG_MS = 5 * 60 * 1000;
 
@@ -267,16 +244,11 @@ async function isOwner(msg) {
   return false;
 }
 
-async function canRunAdminCmd(msg) {
-  try {
-    const chat = await msg.getChat(); // O client.getChatById(...)
-    if (!chat.isGroup) return false;
-    
-    // Tu lógica actual de verificación de admin...
-  } catch (error) {
-    console.error("Error obteniendo el chat:", error.message);
-    return false; // Si falla la consulta del chat, deniega temporalmente el comando sin romper el bot
-  }
+async function canRunAdminCmd(msg, isGroupMsg) {
+  if (await isOwner(msg)) return true;
+  if (!isGroupMsg) return false;
+  const chat = await msg.getChat();
+  return isSenderAdminInGroup(chat, msg);
 }
 
 // Matching de comandos (case/acentos/espacios)
@@ -690,3 +662,4 @@ client.initialize().catch(err => {
   console.error('❌ Error al inicializar el cliente:', err);
   shutdown(1);
 });
+
