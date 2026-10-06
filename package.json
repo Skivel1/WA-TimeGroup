@@ -1,6 +1,6 @@
 {
   "name": "skibot",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Bot de WhatsApp para el gremio (whatsapp-web.js) listo para Docker",
   "main": "index.js",
   "scripts": {
@@ -14,6 +14,6 @@
     "libphonenumber-js": "^1.12.10",
     "luxon": "^3.7.1",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.34.4"
+    "whatsapp-web.js": "github:wwebjs/whatsapp-web.js#main"
   }
 }
