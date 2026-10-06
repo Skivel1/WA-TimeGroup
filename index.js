@@ -6,7 +6,8 @@ const path = require('path');
 const { Client, LocalAuth, Poll } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { DateTime } = require('luxon');
-const { parsePhoneNumberFromString } = require('libphonenumber-js');
+const { parsePhoneNumber } = require('libphonenumber-js');
+const ct = require('countries-and-timezones');
 
 // ================== Config (variables de entorno) ==================
 const BOT_NAME = process.env.BOT_NAME || 'Skibot';
@@ -17,7 +18,7 @@ const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE || '/tmp/skibot-heartbeat';
 const LOG_MESSAGES = process.env.LOG_MESSAGES === 'true'; // loguear TODOS los mensajes (debug)
 // Por defecto SOLO la lista (owner/admins) puede usar comandos; el resto se ignora en silencio.
 const PUBLIC_COMMANDS = process.env.PUBLIC_COMMANDS === 'true';       // true = !comandos, !link gremio, etc. abiertos a todos
-const ALLOW_GROUP_ADMINS = process.env.ALLOW_GROUP_ADMINS === 'true'; // true = también admins del grupo según WhatsApp
+const ALLOW_GROUP_ADMINS = process.env.ALLOW_GROUP_ADMINS !== 'false'; // default true: los admins del grupo (según WhatsApp) también pueden; 'false' = solo la lista
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 3000);
 const WATCHDOG_MS = 5 * 60 * 1000;
 
@@ -25,30 +26,28 @@ const botStartTime = new Date();
 
 // Número del owner: últimos 10 dígitos SIN +52 ni prefijos
 const OWNER_NUMBER_BASE10 = toBase10(process.env.OWNER_NUMBER || '');
-// Admins fijos opcionales (no dependen de WhatsApp Web): ADMIN_NUMBERS=8111111111,8222222222
+// Listas por variable de entorno. Se acepta separar con coma, punto y coma o espacios,
+// y entradas con comillas. Cada entrada puede ser:
+//   • un ID exacto  → 50337134186514@lid   (o solo 50337134186514)
+//   • un teléfono   → 528123456789          (se compara contra el número del remitente)
+const splitList = v => String(v || '').split(/[,;\s]+/)
+  .map(x => x.trim().replace(/^["']+|["']+$/g, '')).filter(Boolean);
+const isPhoneLike = x => !x.includes('@') && /^\+?\d{7,15}$/.test(x);
+const idsOf = v => new Set(splitList(v).filter(x => !isPhoneLike(x)));
+const phonesOf = v => splitList(v).filter(isPhoneLike).map(toBase10);
+
+const OWNER_IDS = idsOf(process.env.OWNER_IDS);
+const ADMIN_IDS = idsOf(process.env.ADMIN_IDS);
+// Teléfonos de admin: ADMIN_NUMBERS + teléfonos escritos dentro de ADMIN_IDS
 const ADMIN_NUMBERS = new Set(
-  (process.env.ADMIN_NUMBERS || '').split(',').map(toBase10).filter(x => x.length >= 7)
+  [...splitList(process.env.ADMIN_NUMBERS).map(toBase10), ...phonesOf(process.env.ADMIN_IDS)].filter(x => x.length >= 7)
 );
-// IDs exactos (útiles cuando WhatsApp te identifica como xxxx@lid en grupos).
-// Obtén el tuyo escribiendo !id en el grupo. Separados por coma.
-const parseIds = v => new Set((v || '').split(',').map(x => x.trim()).filter(Boolean));
-const OWNER_IDS = parseIds(process.env.OWNER_IDS);
-const ADMIN_IDS = parseIds(process.env.ADMIN_IDS);
+const OWNER_EXTRA_NUMBERS = phonesOf(process.env.OWNER_IDS).filter(x => x.length >= 7);
 if (!OWNER_NUMBER_BASE10) {
   console.warn('⚠️ OWNER_NUMBER no está definido: nadie tendrá permisos de owner.');
 }
 
-const countryTimezoneMap = {
-  MX: { zone: 'America/Mexico_City', flag: '🇲🇽' },
-  AR: { zone: 'America/Argentina/Buenos_Aires', flag: '🇦🇷' },
-  CO: { zone: 'America/Bogota', flag: '🇨🇴' },
-  BR: { zone: 'America/Sao_Paulo', flag: '🇧🇷' },
-  US: { zone: 'America/New_York', flag: '🇺🇸' },
-  VE: { zone: 'America/Caracas', flag: '🇻🇪' },
-  BO: { zone: 'America/La_Paz', flag: '🇧🇴' },
-  CL: { zone: 'America/Santiago', flag: '🇨🇱' },
-  PE: { zone: 'America/Lima', flag: '🇵🇪' },
-};
+// (Las zonas horarias ahora se calculan para TODOS los países; ver sección "Zonas horarias")
 
 // ================== Estado en memoria (con limpieza) ==================
 // DM id -> { step, evento, fecha, hora, groups:[{id,name}], ts }
@@ -59,19 +58,6 @@ const lastWelcomeAt = new Map(); // `${chatId}::${participantId}` -> ms
 const MIN_INTERVAL_MS = 1500;
 
 const cooldowns = new Map(); // `${sender}::${cmd}` -> ms
-
-const phoneCache = new Map(); // id serializado -> dígitos del teléfono real
-
-// Respaldo cuando WhatsApp Web no deja leer los miembros del grupo:
-// recordamos a quienes escriben / entran. chatId -> Set(ids)
-const groupSeen = new Map();
-const GROUP_SEEN_MAX = 1024;
-function rememberMember(chatId, id) {
-  if (!chatId || !id) return;
-  let set = groupSeen.get(chatId);
-  if (!set) { set = new Set(); groupSeen.set(chatId, set); }
-  if (set.size < GROUP_SEEN_MAX) set.add(String(id));
-}
 
 // ================== Sesión: limpiar locks de Chromium ==================
 // Tras un cierre sucio (docker kill / corte de luz) quedan estos archivos y
@@ -152,15 +138,9 @@ client.on('qr', qr => {
 });
 
 let watchdogTimer = null;
-client.on('ready', async () => {
+client.on('ready', () => {
   console.log('✅ Bot listo para funcionar');
   beat();
-  try {
-    const webVer = await client.getWWebVersion();
-    let libVer = '?';
-    try { libVer = require('whatsapp-web.js/package.json').version; } catch (_) { /* noop */ }
-    console.log(`ℹ️ whatsapp-web.js ${libVer} | WhatsApp Web ${webVer}`);
-  } catch (_) { /* noop */ }
   if (watchdogTimer) return;
   watchdogTimer = setInterval(async () => {
     try {
@@ -216,6 +196,7 @@ setInterval(() => {
   for (const [k, v] of encuestaState) if (now - v.ts > STATE_TTL_MS) encuestaState.delete(k);
   for (const [k, t] of lastWelcomeAt) if (now - t > 60 * 60 * 1000) lastWelcomeAt.delete(k);
   for (const [k, t] of cooldowns) if (now - t > 60 * 1000) cooldowns.delete(k);
+  for (const [k, v] of adminCache) if (now - v.ts > ADMIN_STALE_MS) adminCache.delete(k);
 }, 5 * 60 * 1000).unref();
 
 // ================== Helpers ==================
@@ -266,151 +247,49 @@ async function ensureParticipants(chat) {
   return chat.participants || [];
 }
 
-// ---- Resolver número real (maneja @c.us y @lid) ----
-// En grupos WhatsApp puede identificar a los miembros como xxxx@lid; en ese caso
-// id.user NO es el teléfono, hay que pedir el contacto para obtener el número real.
-async function resolvePhoneDigits(id, hintPn = null) {
-  const serialized = typeof id === 'string' ? id : id?._serialized;
-  if (!serialized) return '';
-  if (phoneCache.has(serialized)) return phoneCache.get(serialized);
+// ---------- Admins del grupo (según WhatsApp) ----------
+// Se compara por ID exacto (@lid o @c.us) y por teléfono (últimos 10 dígitos), con caché:
+//  • 60 s de caché "fresca" para no consultar WhatsApp Web en cada comando
+//  • si WhatsApp Web falla, se usa la última lista conocida (hasta 15 min)
+const adminCache = new Map(); // chatId -> { ids:Set, phones:Set, ts }
+const ADMIN_FRESH_MS = 60 * 1000;
+const ADMIN_STALE_MS = 15 * 60 * 1000;
 
-  const onlyDigits = v => String(v || '').split('@')[0].replace(/\D/g, '');
-  let digits = '';
-
-  if (hintPn && onlyDigits(hintPn)) {
-    // El Store ya nos dio el número real junto al participante
-    digits = onlyDigits(hintPn);
-  } else if (serialized.endsWith('@c.us')) {
-    digits = onlyDigits(serialized);
-  } else if (serialized.endsWith('@lid')) {
-    // 1) API de whatsapp-web.js (versiones recientes): LID -> número real
-    if (typeof client.getContactLidAndPhone === 'function') {
-      try {
-        const r = await client.getContactLidAndPhone([serialized]);
-        const pn = Array.isArray(r) ? r[0]?.pn : null;
-        if (pn) digits = onlyDigits(pn);
-      } catch (_) { /* noop */ }
-    }
-    // 2) Fallback: Store interno de WhatsApp Web
-    if (!digits && client.pupPage) {
-      try {
-        const pn = await client.pupPage.evaluate(lid => {
-          const wid = window.Store.WidFactory.createWid(lid);
-          const p = window.Store.LidUtils?.getPhoneNumber?.(wid);
-          return p ? p._serialized || String(p) : null;
-        }, serialized);
-        if (pn) digits = onlyDigits(pn);
-      } catch (_) { /* noop */ }
-    }
-    // 3) Último recurso: el contacto, SOLO si trae un número distinto del LID
-    if (!digits) {
-      const contact = await client.getContactById(serialized).catch(() => null);
-      if (contact?.id?.server === 'c.us') digits = onlyDigits(contact.id.user);
-      else if (contact?.number && onlyDigits(contact.number) !== onlyDigits(serialized)) {
-        digits = onlyDigits(contact.number);
-      }
-    }
-  } else {
-    digits = onlyDigits(serialized);
-  }
-
-  if (digits) phoneCache.set(serialized, digits); // no cacheamos fallos
-  return digits;
+async function loadGroupAdmins(chat) {
+  const admins = (await ensureParticipants(chat)).filter(isAdminFlag);
+  const ids = new Set(admins.map(p => p?.id?._serialized).filter(Boolean));
+  const { numbers } = await participantNumbers(admins); // resuelve @lid → teléfono
+  const phones = new Set(numbers.map(toBase10).filter(x => x.length >= 7));
+  return { ids, phones, ts: Date.now() };
 }
 
-// Miembros de un grupo SIN usar getChat() (que WhatsApp Web rechaza a veces).
-// Devuelve [{ id: '...@lid|@c.us', pn: '5218...@c.us' | null }]
-async function getGroupMembers(chatId) {
-  // 1) Directo del Store de WhatsApp Web
-  if (client.pupPage) {
-    try {
-      const res = await client.pupPage.evaluate(async id => {
-        // Obtener los módulos: primero window.Store, si no, directo con window.require
-        let S = null;
-        if (window.Store && window.Store.WidFactory) {
-          S = window.Store;
-        } else if (typeof window.require === 'function') {
-          try {
-            const cols = window.require('WAWebCollections');
-            S = {
-              WidFactory: window.require('WAWebWidFactory'),
-              GroupMetadata: cols.GroupMetadata,
-              Chat: cols.Chat,
-            };
-          } catch (e) { return { err: 'require falló: ' + (e && e.message) }; }
-        }
-        if (!S || !S.WidFactory) return { err: 'no hay window.Store ni window.require' };
+async function checkGroupAdmin(msg) {
+  const chatId = msg.from;
+  let info = adminCache.get(chatId);
 
-        const wid = S.WidFactory.createWid(id);
-        let meta = S.GroupMetadata?.get?.(wid) || S.Chat?.get?.(wid)?.groupMetadata;
-        if (!meta && S.GroupMetadata?.find) meta = await S.GroupMetadata.find(wid);
-        if (!meta) return { err: 'metadata del grupo no encontrada' };
-
-        const raw = meta.participants;
-        const parts = raw?.getModelsArray ? raw.getModelsArray() : (Array.isArray(raw) ? raw : []);
-        return {
-          list: parts.map(p => ({
-            id: p.id?._serialized || null,
-            pn: p.phoneNumber?._serialized || p.pn?._serialized || null,
-          })).filter(p => p.id),
-        };
-      }, chatId);
-      if (res?.list?.length) return res.list;
-      console.error(`⚠️ getGroupMembers (Store): ${res?.err || 'lista vacía'}`);
-    } catch (e) {
-      console.error(`⚠️ getGroupMembers (Store) falló: ${shortErr(e)}`);
+  if (!info || Date.now() - info.ts > ADMIN_FRESH_MS) {
+    let loaded = null;
+    const chat = await safeCall(() => msg.getChat(), 'getChat (permisos)');
+    if (chat && chat.isGroup) {
+      try { loaded = await loadGroupAdmins(chat); } catch (e) { console.error('⚠️ No pude leer admins del grupo:', shortErr(e)); }
+    }
+    if (loaded && loaded.ids.size + loaded.phones.size > 0) {
+      adminCache.set(chatId, loaded);
+      info = loaded;
+    } else if (info && Date.now() - info.ts <= ADMIN_STALE_MS) {
+      console.log('ℹ️ WhatsApp Web no respondió; uso la lista de admins en caché');
+    } else {
+      return { ok: false, reason: 'no se pudo verificar admin del grupo (error de WhatsApp Web)' };
     }
   }
-  // 2) Respaldo: getChatById clásico
-  const chat = await safeCall(() => client.getChatById(chatId), 'getChatById (miembros)', 2);
-  if (chat) {
-    const parts = await ensureParticipants(chat);
-    return parts.map(p => ({ id: p.id?._serialized, pn: null })).filter(p => p.id);
-  }
-  // 3) Respaldo: miembros que hemos visto escribir o entrar a este grupo
-  const seen = groupSeen.get(chatId);
-  if (seen && seen.size) {
-    console.warn(`⚠️ Usando miembros vistos (${seen.size}) porque WhatsApp Web no permite leer el grupo. Actualiza whatsapp-web.js.`);
-    return [...seen].map(id => ({ id, pn: null }));
-  }
-  return [];
-}
 
-function countryFromDigits(digits) {
-  if (!digits) return null;
-  try { return parsePhoneNumberFromString(`+${digits}`)?.country || null; }
-  catch (_) { return null; }
-}
+  const author = String(msg.author || '');
+  if (author && info.ids.has(author)) return { ok: true, reason: 'admin del grupo' };
 
-const cityName = zone => zone.split('/').pop().replace(/_/g, ' ');
+  const num = await senderFullNumber(msg);
+  if (num && info.phones.has(toBase10(num))) return { ok: true, reason: 'admin del grupo' };
 
-// ¿El remitente es admin del grupo? (coincidencia EXACTA por últimos 10 dígitos)
-async function isSenderAdminInGroup(chat, msg) {
-  if (!chat.isGroup) return false;
-
-  const contact = await msg.getContact().catch(() => null);
-  const senderBases = [contact?.number, contact?.id?._serialized, contact?.id?.user, msg.author]
-    .filter(Boolean)
-    .map(extractUserBase10)
-    .filter(x => x.length >= 7);
-  if (!senderBases.length) return false;
-
-  const parts = await ensureParticipants(chat);
-  const adminSet = new Set(
-    parts.filter(isAdminFlag).map(p => extractUserBase10(p?.id)).filter(x => x.length >= 7)
-  );
-
-  if (typeof chat.getAdmins === 'function') {
-    try {
-      const admins = await chat.getAdmins();
-      for (const a of (Array.isArray(admins) ? admins : [])) {
-        const base = extractUserBase10(a?.number || a?.id?._serialized || a?.id || a);
-        if (base && base.length >= 7) adminSet.add(base);
-      }
-    } catch (_) { /* noop */ }
-  }
-
-  return senderBases.some(b => adminSet.has(b));
+  return { ok: false, reason: 'no está en la lista ni es admin del grupo' };
 }
 
 // Número (10 dígitos) del remitente. Barato si el id es @c.us; solo consulta el
@@ -422,7 +301,7 @@ async function senderBase10(msg) {
   const contact = await msg.getContact().catch(() => null);
   return contact?.number ? toBase10(contact.number) : '';
 }
-const OWNER_SET = new Set(OWNER_NUMBER_BASE10 ? [OWNER_NUMBER_BASE10] : []);
+const OWNER_SET = new Set([...(OWNER_NUMBER_BASE10 ? [OWNER_NUMBER_BASE10] : []), ...OWNER_EXTRA_NUMBERS]);
 function idMatches(msg, set) {
   if (!set.size) return false;
   return [msg.author, msg.from].filter(Boolean)
@@ -460,23 +339,144 @@ async function authorize(msg, isGroupMsg) {
   if (idMatches(msg, OWNER_IDS)) return { ok: true, reason: 'owner (OWNER_IDS)' };
   if (idMatches(msg, ADMIN_IDS)) return { ok: true, reason: 'admin (ADMIN_IDS)' };
 
+  let num = '';
   if (OWNER_SET.size || ADMIN_NUMBERS.size) {
-    const num = await senderBase10(msg);
-    if (num && OWNER_SET.has(num)) return { ok: true, reason: 'owner (OWNER_NUMBER)' };
-    if (num && ADMIN_NUMBERS.has(num)) return { ok: true, reason: 'admin (ADMIN_NUMBERS)' };
+    num = await senderBase10(msg);
+    if (num && OWNER_SET.has(num)) return { ok: true, reason: 'owner (por número)' };
+    if (num && ADMIN_NUMBERS.has(num)) return { ok: true, reason: 'admin (por número)' };
   }
 
   if (ALLOW_GROUP_ADMINS && isGroupMsg) {
-    const chat = await safeCall(() => msg.getChat(), 'getChat (permisos)');
-    if (!chat) return { ok: false, reason: 'no se pudo verificar admin del grupo (error de WhatsApp Web)' };
-    try {
-      if (await isSenderAdminInGroup(chat, msg)) return { ok: true, reason: 'admin del grupo' };
-    } catch (e) {
-      return { ok: false, reason: `no se pudo verificar admin del grupo (${shortErr(e)})` };
+    const r = await checkGroupAdmin(msg);
+    return { ok: r.ok, num, reason: r.reason };
+  }
+  return { ok: false, num, reason: 'no está en la lista de owner/admins' };
+}
+
+// ================== Zonas horarias (todos los países) ==================
+// Para países con varias zonas, el número de teléfono no dice en cuál vive la persona:
+// usamos la zona "principal". Para el resto se usa la única zona del país.
+const MAIN_ZONE = {
+  MX: 'America/Mexico_City', US: 'America/New_York', CA: 'America/Toronto', BR: 'America/Sao_Paulo',
+  AR: 'America/Argentina/Buenos_Aires', CL: 'America/Santiago', EC: 'America/Guayaquil',
+  ES: 'Europe/Madrid', PT: 'Europe/Lisbon', RU: 'Europe/Moscow', AU: 'Australia/Sydney',
+  ID: 'Asia/Jakarta', KZ: 'Asia/Almaty', MN: 'Asia/Ulaanbaatar', CD: 'Africa/Kinshasa',
+  NZ: 'Pacific/Auckland', UA: 'Europe/Kyiv', GL: 'America/Nuuk', FM: 'Pacific/Chuuk',
+  PF: 'Pacific/Tahiti', KI: 'Pacific/Tarawa', CN: 'Asia/Shanghai',
+};
+const zoneOk = z => Boolean(z) && DateTime.now().setZone(z).isValid;
+const zoneCache = new Map();
+function countryZone(iso) {
+  if (zoneCache.has(iso)) return zoneCache.get(iso);
+  let zone = null;
+  if (zoneOk(MAIN_ZONE[iso])) {
+    zone = MAIN_ZONE[iso];
+  } else {
+    const zones = (ct.getCountry(iso)?.timezones || []).filter(zoneOk);
+    if (zones.length === 1) zone = zones[0];
+    else if (zones.length > 1) { // la zona cuyo offset es el más repetido
+      const count = new Map();
+      for (const z of zones) { const o = DateTime.now().setZone(z).offset; count.set(o, (count.get(o) || 0) + 1); }
+      const best = [...count.entries()].sort((a, b) => b[1] - a[1])[0][0];
+      zone = zones.find(z => DateTime.now().setZone(z).offset === best);
     }
   }
-  return { ok: false, reason: 'no está en la lista de owner/admins' };
+  zoneCache.set(iso, zone);
+  return zone;
 }
+
+const flagOf = iso => String.fromCodePoint(...[...iso.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
+function isoFromFlagOrCode(str) {
+  const t = String(str || '').trim();
+  const cps = [...t].map(c => c.codePointAt(0));
+  if (cps.length === 2 && cps.every(c => c >= 0x1F1E6 && c <= 0x1F1FF)) {
+    return String.fromCharCode(...cps.map(c => c - 0x1F1E6 + 65));
+  }
+  if (/^[A-Za-z]{2}$/.test(t) && ct.getCountry(t.toUpperCase())) return t.toUpperCase();
+  return null;
+}
+const regionNames = (() => { try { return new Intl.DisplayNames(['es'], { type: 'region' }); } catch (_) { return null; } })();
+const countryName = iso => { try { return regionNames?.of(iso) || iso; } catch (_) { return iso; } };
+const cityOf = zone => zone.split('/').pop().replace(/_/g, ' ');
+
+function utcLabel(offsetMin) {
+  const a = Math.abs(offsetMin), h = Math.floor(a / 60), m = a % 60;
+  return `UTC${offsetMin < 0 ? '−' : '+'}${h}${m ? ':' + String(m).padStart(2, '0') : ''}`;
+}
+function dayDelta(local, base) {
+  const d = x => DateTime.fromISO(x.toISODate(), { zone: 'utc' });
+  return Math.round(d(local).diff(d(base), 'days').days);
+}
+function countryFromNumber(digits) {
+  try {
+    const p = parsePhoneNumber(`+${digits}`);
+    if (!p) return null;
+    return p.country || (typeof p.getPossibleCountries === 'function' ? p.getPossibleCountries()[0] : null) || null;
+  } catch (_) { return null; }
+}
+
+// Número completo (con código de país) de quien envía. Si WhatsApp lo oculta tras un @lid, se resuelve.
+const lidCache = new Map(); // lid -> dígitos del teléfono
+const cacheLid = (lid, d) => { if (lidCache.size > 5000) lidCache.clear(); lidCache.set(lid, d); };
+async function senderFullNumber(msg) {
+  const raw = String(msg.author || msg.from || '');
+  if (!raw.endsWith('@lid')) return raw.split('@')[0].replace(/\D/g, '');
+  if (lidCache.has(raw)) return lidCache.get(raw);
+  const contact = await msg.getContact().catch(() => null);
+  let d = contact?.number ? String(contact.number).replace(/\D/g, '') : '';
+  if (!d) {
+    const res = await safeCall(() => client.getContactLidAndPhone([raw]), 'resolver @lid del remitente', 1);
+    if (res?.[0]?.pn) d = String(res[0].pn).split('@')[0].replace(/\D/g, '');
+  }
+  if (d) cacheLid(raw, d);
+  return d;
+}
+
+// Teléfonos de todos los participantes. Los @lid se resuelven por lotes (con caché).
+async function participantNumbers(participants) {
+  const numbers = [];
+  const pending = [];
+  for (const p of participants || []) {
+    const ser = p?.id?._serialized || '';
+    if (ser.endsWith('@lid') || p?.id?.server === 'lid') {
+      const lid = ser || `${p.id.user}@lid`;
+      if (lidCache.has(lid)) numbers.push(lidCache.get(lid)); else pending.push(lid);
+    } else {
+      const d = String(p?.id?.user || p?.number || '').replace(/\D/g, '');
+      if (d) numbers.push(d);
+    }
+  }
+  let unresolved = 0;
+  for (let i = 0; i < pending.length; i += 40) {
+    const chunk = pending.slice(i, i + 40);
+    const res = await safeCall(() => client.getContactLidAndPhone(chunk), 'resolver @lid de participantes', 2);
+    chunk.forEach((lid, idx) => {
+      const pn = res?.[idx]?.pn;
+      const d = pn ? String(pn).split('@')[0].replace(/\D/g, '') : '';
+      if (d) { cacheLid(lid, d); numbers.push(d); } else unresolved++;
+    });
+  }
+  return { numbers, unresolved };
+}
+
+// Agrupa a los miembros por hora local (mismo offset UTC = misma línea)
+function convertToZones(numbers, baseTime) {
+  const byOffset = new Map();
+  let unknown = 0;
+  for (const n of numbers) {
+    const iso = countryFromNumber(n);
+    const zone = iso && countryZone(iso);
+    if (!zone) { unknown++; continue; }
+    const local = baseTime.setZone(zone);
+    if (!byOffset.has(local.offset)) byOffset.set(local.offset, { offset: local.offset, local, countries: new Map() });
+    const g = byOffset.get(local.offset);
+    g.countries.set(iso, (g.countries.get(iso) || 0) + 1);
+  }
+  return { groups: [...byOffset.values()].sort((a, b) => a.offset - b.offset), unknown };
+}
+const dayTag = d => (d > 0 ? ' (día siguiente)' : d < 0 ? ' (día anterior)' : '');
+const countriesTxt = g => [...g.countries.entries()].sort((a, b) => b[1] - a[1])
+  .map(([iso, n]) => `${flagOf(iso)} ${iso}${n > 1 ? ` ×${n}` : ''}`).join('  ');
 
 // Matching de comandos (case/acentos/espacios)
 function normCmd(s) {
@@ -526,9 +526,6 @@ client.on('message', async msg => {
 
     if (LOG_MESSAGES) console.log(`📥 [${new Date().toLocaleString()}] ${senderLabel(msg)} | ID: ${msg.author || msg.from} | ${msg.from}: "${rawBody}"`);
 
-    // Recordar quién habla en el grupo (barato, sin tocar el navegador)
-    if (isGroupMsg && msg.author) rememberMember(msg.from, msg.author);
-
     // El 95% de los mensajes de grupo termina aquí
     if (!inFlow && !COMMAND_START.test(normCmd(rawBody))) return;
 
@@ -544,7 +541,9 @@ client.on('message', async msg => {
       console.log(`📩 ${who} | ID: ${senderId} | ${where} | "${preview}" → ${auth.ok ? '✅ autorizado: ' + auth.reason : '❌ ' + auth.reason}`);
 
       if (!auth.ok && (adminOnly || !PUBLIC_COMMANDS)) {
-        console.log(`⛔ IGNORADO: ${senderId} (${who}) no es admin/owner → sin respuesta`);
+        const numTxt = auth.num ? `número resuelto: ${auth.num}` : 'número NO resuelto';
+        console.log(`⛔ IGNORADO: ${senderId} (${who}) → sin respuesta (${numTxt})`);
+        console.log(`   💡 Para autorizarlo agrega a ADMIN_IDS exactamente: ${senderId}`);
         return;
       }
     }
@@ -607,23 +606,19 @@ client.on('message', async msg => {
             : state.groups.find(g => normCmd(g.name) === normCmd(text));
           if (!target) return msg.reply('⛔ No encontré ese grupo. Responde con número o nombre exacto.');
 
-          // Resumen de horarios locales (según el país real de los miembros)
+          const targetChat = await safeCall(() => client.getChatById(target.id), 'getChatById (encuesta)');
+
+          // Resumen de horarios locales (según prefijo telefónico de los miembros)
           const baseTime = DateTime.fromFormat(
             `${state.fecha} ${state.hora}`, 'dd/MM/yyyy HH:mm', { zone: 'America/Mexico_City' }
           );
-          const zonasVistas = new Set();
+          const parts = targetChat ? await ensureParticipants(targetChat) : [];
+          const { numbers } = await participantNumbers(parts);
+          const { groups } = convertToZones(numbers, baseTime);
           let tzSummary = '🕒 Horarios locales:\n';
-          const participants = await getGroupMembers(target.id);
-          const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id, p.pn)));
-          for (const digits of phones) {
-            const country = countryFromDigits(digits);
-            if (country && countryTimezoneMap[country]) {
-              const { zone, flag } = countryTimezoneMap[country];
-              if (!zonasVistas.has(zone)) {
-                zonasVistas.add(zone);
-                tzSummary += `${flag} ${baseTime.setZone(zone).toFormat('HH:mm')}\n`;
-              }
-            }
+          for (const g of groups) {
+            const flags = [...g.countries.keys()].slice(0, 6).map(flagOf).join('');
+            tzSummary += `${flags} ${g.local.toFormat('HH:mm')}${dayTag(dayDelta(g.local, baseTime))}\n`;
           }
 
           const pollText =
@@ -715,9 +710,8 @@ client.on('message', async msg => {
    ➤ Comando: \`!discord gremio\`
 
 4. *Conversión Horaria para el Grupo* 🕒
-   ➤ Comando: \`Consultar hora HH:MM\`
-   ➤ Ejemplo: \`Consultar hora 15:30\`
-   ➤ Opcional: agrega una bandera para usar otra zona base, ej. \`Consultar hora 15:30 🇦🇷\`
+   ➤ Tu hora local: \`Consultar hora 15:30\`
+   ➤ Hora de otro país: \`Consultar hora 15:30 🇦🇷\`
 
 5. *Encuesta de Roles (solo admins)* 📊
    ➤ Comando: \`!encuesta roles\`
@@ -744,88 +738,81 @@ client.on('message', async msg => {
     }
 
     // ============ Consultar hora ============
-    // Responde primero con la hora en la zona del remitente (o la bandera indicada)
-    // y debajo la conversión a los países de los demás miembros del grupo.
+    // "Consultar hora 21:39"        → 21:39 en la zona de QUIEN ESCRIBE (según su número)
+    // "Consultar hora 21:39 🇦🇷"    → 21:39 en la zona de esa bandera / código de país
     if (startsWithCmd(rawBody, ['consultar hora', '!consultar hora'])) { // con o sin !
       if (onCooldown(msg, 'hora')) return;
 
       const clean = rawBody.replace(/\u200B/g, '');
       const m = clean.match(/consultar hora\s+(\d{1,2}):(\d{2})\s*(.+)?/i);
       if (!m) {
-        return msg.reply('⛔ Usa el formato: *Consultar hora 20:00*\n(opcional: agrega una bandera para usar otra zona base, ej. *Consultar hora 20:00 🇦🇷*)');
+        return msg.reply('⛔ Usa el formato: *Consultar hora 20:00*\nEjemplos:\n• *Consultar hora 20:00* (tu hora local)\n• *Consultar hora 20:00 🇦🇷* (hora de Argentina)');
       }
 
       const hour = parseInt(m[1], 10);
       const minute = parseInt(m[2], 10);
-      const flagInput = m[3] ? m[3].trim() : '';
-
       if (hour > 23 || minute > 59) {
         return msg.reply('⛔ Hora inválida. Usa formato 24h como *20:00* 🕒');
       }
 
-      // ---- 1) Zona base: bandera (si la pones) o país del remitente ----
-      let baseCode = null;
-
-      if (flagInput) {
-        for (const [code, data] of Object.entries(countryTimezoneMap)) {
-          if (data.flag === flagInput || code === flagInput.toUpperCase()) { baseCode = code; break; }
+      // 1) ¿En qué zona está la hora que escribió?
+      let baseIso = null;
+      let whoTxt = 'hora de quien consulta';
+      if (m[3] && m[3].trim()) {
+        baseIso = isoFromFlagOrCode(m[3]);
+        if (!baseIso) {
+          return msg.reply(`⛔ No reconocí "${m[3].trim()}". Usa una bandera (🇦🇷) o el código de país (AR).\nEjemplo: *Consultar hora 20:00 🇲🇽*`);
         }
-        if (!baseCode) {
-          let banderas = '🚩 *Banderas disponibles:*\n';
-          for (const [code, data] of Object.entries(countryTimezoneMap)) {
-            banderas += `• ${data.flag} ${code} (${cityName(data.zone)})\n`;
-          }
-          return msg.reply(`⛔ Bandera no reconocida: "${flagInput}"\n\n${banderas}`);
-        }
+        whoTxt = `hora en ${countryName(baseIso)}`;
       } else {
-        let digits = await resolvePhoneDigits(msg.author || msg.from);
-        if (!digits) {
-          const c = await msg.getContact().catch(() => null);
-          digits = String(c?.number || '').replace(/\D/g, '');
-        }
-        const c = countryFromDigits(digits);
-        baseCode = (c && countryTimezoneMap[c]) ? c : 'MX'; // fallback CDMX
-        console.log(`🕒 Zona base de ${who}: tel=${digits || '?'} → ${baseCode}`);
+        const num = await senderFullNumber(msg);
+        baseIso = num ? countryFromNumber(num) : null;
+      }
+      let baseZone = baseIso && countryZone(baseIso);
+      if (!baseZone) { // no se pudo saber: asumimos México
+        baseIso = 'MX'; baseZone = 'America/Mexico_City'; whoTxt = 'hora (no pude detectar tu país; asumo México)';
       }
 
-      const base = countryTimezoneMap[baseCode];
-      const baseTime = DateTime.fromObject({ hour, minute }, { zone: base.zone });
+      const baseTime = DateTime.now().setZone(baseZone).set({ hour, minute, second: 0, millisecond: 0 });
 
-      let response =
-        `🕓 *Tu hora: ${baseTime.toFormat('HH:mm')}* ${base.flag} (${cityName(base.zone)})\n`;
-
-      // ---- 2) Conversión a los países de los demás miembros ----
+      // 2) Conversión para todos los miembros del grupo
+      let groups = [], unknown = 0, couldRead = true;
       if (isGroupMsg) {
-        const participants = await getGroupMembers(msg.from);
-
-        const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id, p.pn)));
-        participants.forEach((p, i) => {
-          const d = phones[i];
-          console.log(`   👤 ${p.id} → tel=${d || '❌ sin resolver'} → país=${countryFromDigits(d) || '?'}`);
-        });
-        const seen = new Set([baseCode]);
-        const lines = [];
-
-        phones.forEach(digits => {
-          const iso = countryFromDigits(digits);
-          if (!iso || seen.has(iso) || !countryTimezoneMap[iso]) return;
-          seen.add(iso);
-
-          const tz = countryTimezoneMap[iso];
-          const local = baseTime.setZone(tz.zone);
-          const diff = local.startOf('day').diff(baseTime.startOf('day'), 'days').days; // sin depender de local.day
-          const cambioDia = diff > 0 ? ' (día siguiente)' : diff < 0 ? ' (día anterior)' : '';
-          lines.push(`${tz.flag} *${local.toFormat('HH:mm')}* – ${cityName(tz.zone)}${cambioDia}`);
-        });
-
-        console.log(`🕒 Participantes: ${participants.length}, con teléfono resuelto: ${phones.filter(Boolean).length}, zonas: ${lines.length}`);
-
-        response += lines.length
-          ? `\n🌎 *Conversión para el grupo:*\n${lines.join('\n')}`
-          : '\nℹ️ No se detectaron miembros de otros países en el grupo.';
-      } else {
-        response += '\nℹ️ Usa este comando en un grupo para ver la conversión de sus miembros.';
+        const chat = await safeCall(() => msg.getChat(), 'getChat (hora)', 2);
+        if (chat) {
+          const { numbers, unresolved } = await participantNumbers(await ensureParticipants(chat));
+          const r = convertToZones(numbers, baseTime);
+          groups = r.groups;
+          unknown = r.unknown + unresolved;
+        } else {
+          couldRead = false;
+        }
       }
+
+      const baseOffset = baseTime.offset;
+      const sameGroup = groups.find(g => g.offset === baseOffset);
+      const others = groups.filter(g => g.offset !== baseOffset);
+
+      let response = `🕓 *${baseTime.toFormat('HH:mm')}* — ${whoTxt}\n` +
+        `📍 ${flagOf(baseIso)} ${countryName(baseIso)} · ${cityOf(baseZone)} (${utcLabel(baseOffset)})`;
+      if (sameGroup) {
+        const extra = [...sameGroup.countries.entries()].filter(([iso]) => iso !== baseIso);
+        if (extra.length) response += `\n🤝 Misma hora: ${extra.map(([iso, n]) => `${flagOf(iso)} ${iso}${n > 1 ? ` ×${n}` : ''}`).join('  ')}`;
+      }
+
+      if (others.length) {
+        const MAX_LINES = 20;
+        response += '\n\n🌎 *Hora en el grupo:*\n' +
+          others.slice(0, MAX_LINES).map(g =>
+            `🕙 *${g.local.toFormat('HH:mm')}*${dayTag(dayDelta(g.local, baseTime))} (${utcLabel(g.offset)}) — ${countriesTxt(g)}`
+          ).join('\n');
+        if (others.length > MAX_LINES) response += `\n… y ${others.length - MAX_LINES} zonas más`;
+      } else if (isGroupMsg && couldRead) {
+        response += '\n\nℹ️ No hay miembros en otras zonas horarias.';
+      }
+      if (!couldRead) response += '\n\n⚠️ No pude leer la lista de miembros (error de WhatsApp Web). Intenta de nuevo en un minuto.';
+      if (unknown) response += `\n\nℹ️ ${unknown} miembro(s) sin país identificable.`;
+      if (others.length || sameGroup) response += '\n\n_Países con varias zonas (EE. UU., Brasil, México…) usan su zona principal._';
 
       return msg.reply(response);
     }
@@ -857,7 +844,6 @@ async function handleWelcome(notification) {
       const now = Date.now();
       if (now - (lastWelcomeAt.get(key) || 0) < MIN_INTERVAL_MS) continue;
       lastWelcomeAt.set(key, now); // marcar ANTES de await evita dobles por carrera
-      rememberMember(chatKey, participantId);
 
       let contact = null;
       try {
@@ -874,7 +860,7 @@ async function handleWelcome(notification) {
         `🎉 *¡Bienvenid@* ${tag} *a esta pequeña familia!* 🫂✨\n\n` +
         `🎮 Déjanos tu *nick* y las *líneas que juegas* 🧙‍♂️🏹🛡️\n\n` +
         `💳 Por si las dudas, también deja tu número de tarjeta de crédito, CVV y órganos sanos, por favor 😌🫀🫁😂\n\n` +
-        `¡Disfruta tu estadía en *The Abyss*! 🔥`;
+        `¡Disfruta tu estadía en *Warrior Guardian*! 🔥`;
 
       await client.sendMessage(chatKey, bienvenida, { mentions: contact ? [contact] : [] });
       console.log(`✅ Bienvenida enviada a ${contact?.pushname || contact?.number || participantId}`);
@@ -912,6 +898,20 @@ client.on('group_update', async notification => {
     }
   } catch (_) { /* noop */ }
 });
+
+// ================== Resumen de configuración ==================
+const mask = n => (n.length > 4 ? '…' + n.slice(-4) : n);
+console.log('⚙️ Config → ' + [
+  `OWNER_IDS=[${[...OWNER_IDS].join(', ')}]`,
+  `ADMIN_IDS=[${[...ADMIN_IDS].join(', ')}]`,
+  `owner por número=[${[...OWNER_SET].map(mask).join(', ')}]`,
+  `admins por número=[${[...ADMIN_NUMBERS].map(mask).join(', ')}]`,
+  `PUBLIC_COMMANDS=${PUBLIC_COMMANDS}`,
+  `ALLOW_GROUP_ADMINS=${ALLOW_GROUP_ADMINS}`,
+].join(' | '));
+if (!OWNER_IDS.size && !ADMIN_IDS.size && !OWNER_SET.size && !ADMIN_NUMBERS.size) {
+  console.warn('⚠️ No hay NADIE en la lista (OWNER_*/ADMIN_*): el bot ignorará todos los comandos. ¿Las variables llegan al contenedor?');
+}
 
 // ================== Init ==================
 console.log(`🚀 Iniciando ${BOT_NAME}...`);
