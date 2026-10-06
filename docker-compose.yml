@@ -1,6 +1,7 @@
 services:
   skibot:
     build: .
+    pull_policy: build       # <-- AGREGA ESTA LÍNEA
     image: skibot:latest
     container_name: skibot
     restart: unless-stopped
