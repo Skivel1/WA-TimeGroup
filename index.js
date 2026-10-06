@@ -14,7 +14,30 @@ const DATA_DIR = process.env.DATA_DIR || '.';
 const SESSION_PATH = path.join(DATA_DIR, '.wwebjs_auth');
 const CACHE_PATH = path.join(DATA_DIR, '.wwebjs_cache');
 const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE || '/tmp/skibot-heartbeat';
-const LOG_MESSAGES = process.env.LOG_MESSAGES === 'true'; // loguear TODOS los mensajes (debug)
+const LOG_MESSAGES = process.env.LOG_MESSAGES === 'true'; // loguear T// Reemplaza esto con tu número de WhatsApp registrado (con código de país sin el signo +)
+const MY_NUMBER = '52181XXXXXXXX@c.us'; // O el formato de tu ID de WhatsApp (ej. 521... o 52...)
+
+async function canRunAdminCmd(msg) {
+  // 1. Si el mensaje viene de tu número personal, autorizar de inmediato
+  const senderId = msg.author || msg.from;
+  if (senderId === MY_NUMBER || senderId.includes('528121581206')) {
+    return true;
+  }
+
+  // 2. Validación estándar de administradores en el grupo
+  try {
+    const chat = await msg.getChat();
+    if (!chat.isGroup) return false;
+
+    const authorId = msg.author || msg.from;
+    const participant = chat.participants.find(p => p.id._serialized === authorId);
+
+    return participant && (participant.isAdmin || participant.isSuperAdmin);
+  } catch (error) {
+    console.error("Error al consultar administradores del chat:", error.message);
+    return false;
+  }
+}ODOS los mensajes (debug)
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 3000);
 const WATCHDOG_MS = 5 * 60 * 1000;
 
