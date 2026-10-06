@@ -2,6 +2,9 @@ services:
   skibot:
     build: .
     image: skibot:latest
+    # La imagen se construye localmente: evita que Portainer/compose intente bajar "skibot" de Docker Hub
+    # (error "pull access denied for skibot") al usar Pull and redeploy / Re-pull image.
+    pull_policy: build
     container_name: skibot
     restart: unless-stopped
     init: true               # evita procesos zombie de Chromium
