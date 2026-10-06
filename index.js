@@ -252,7 +252,7 @@ async function ensureParticipants(chat) {
 // ---- Resolver número real (maneja @c.us y @lid) ----
 // En grupos WhatsApp puede identificar a los miembros como xxxx@lid; en ese caso
 // id.user NO es el teléfono, hay que pedir el contacto para obtener el número real.
-async function resolvePhoneDigits(id) {
+async function resolvePhoneDigits(id, hintPn = null) {
   const serialized = typeof id === 'string' ? id : id?._serialized;
   if (!serialized) return '';
   if (phoneCache.has(serialized)) return phoneCache.get(serialized);
@@ -260,7 +260,10 @@ async function resolvePhoneDigits(id) {
   const onlyDigits = v => String(v || '').split('@')[0].replace(/\D/g, '');
   let digits = '';
 
-  if (serialized.endsWith('@c.us')) {
+  if (hintPn && onlyDigits(hintPn)) {
+    // El Store ya nos dio el número real junto al participante
+    digits = onlyDigits(hintPn);
+  } else if (serialized.endsWith('@c.us')) {
     digits = onlyDigits(serialized);
   } else if (serialized.endsWith('@lid')) {
     // 1) API de whatsapp-web.js (versiones recientes): LID -> número real
@@ -296,6 +299,37 @@ async function resolvePhoneDigits(id) {
 
   if (digits) phoneCache.set(serialized, digits); // no cacheamos fallos
   return digits;
+}
+
+// Miembros de un grupo SIN usar getChat() (que WhatsApp Web rechaza a veces).
+// Devuelve [{ id: '...@lid|@c.us', pn: '5218...@c.us' | null }]
+async function getGroupMembers(chatId) {
+  // 1) Directo del Store de WhatsApp Web
+  if (client.pupPage) {
+    try {
+      const list = await client.pupPage.evaluate(async id => {
+        const wid = window.Store.WidFactory.createWid(id);
+        let meta = window.Store.GroupMetadata?.get?.(wid) || window.Store.Chat?.get?.(wid)?.groupMetadata;
+        if (!meta && window.Store.GroupMetadata?.find) meta = await window.Store.GroupMetadata.find(wid);
+        const raw = meta?.participants;
+        const parts = raw?.getModelsArray ? raw.getModelsArray() : (Array.isArray(raw) ? raw : []);
+        return parts.map(p => ({
+          id: p.id?._serialized || null,
+          pn: p.phoneNumber?._serialized || p.pn?._serialized || null,
+        })).filter(p => p.id);
+      }, chatId);
+      if (Array.isArray(list) && list.length) return list;
+    } catch (e) {
+      console.error(`⚠️ getGroupMembers (Store) falló: ${shortErr(e)}`);
+    }
+  }
+  // 2) Respaldo: getChatById clásico
+  const chat = await safeCall(() => client.getChatById(chatId), 'getChatById (miembros)', 2);
+  if (chat) {
+    const parts = await ensureParticipants(chat);
+    return parts.map(p => ({ id: p.id?._serialized, pn: null })).filter(p => p.id);
+  }
+  return [];
 }
 
 function countryFromDigits(digits) {
@@ -526,16 +560,14 @@ client.on('message', async msg => {
             : state.groups.find(g => normCmd(g.name) === normCmd(text));
           if (!target) return msg.reply('⛔ No encontré ese grupo. Responde con número o nombre exacto.');
 
-          const targetChat = await safeCall(() => client.getChatById(target.id), 'getChatById (encuesta)');
-
           // Resumen de horarios locales (según el país real de los miembros)
           const baseTime = DateTime.fromFormat(
             `${state.fecha} ${state.hora}`, 'dd/MM/yyyy HH:mm', { zone: 'America/Mexico_City' }
           );
           const zonasVistas = new Set();
           let tzSummary = '🕒 Horarios locales:\n';
-          const participants = targetChat ? await ensureParticipants(targetChat) : [];
-          const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id)));
+          const participants = await getGroupMembers(target.id);
+          const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id, p.pn)));
           for (const digits of phones) {
             const country = countryFromDigits(digits);
             if (country && countryTimezoneMap[country]) {
@@ -717,13 +749,12 @@ client.on('message', async msg => {
 
       // ---- 2) Conversión a los países de los demás miembros ----
       if (isGroupMsg) {
-        const chat = await safeCall(() => msg.getChat(), 'getChat (hora)', 2);
-        const participants = chat ? await ensureParticipants(chat) : [];
+        const participants = await getGroupMembers(msg.from);
 
-        const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id)));
+        const phones = await Promise.all(participants.map(p => resolvePhoneDigits(p.id, p.pn)));
         participants.forEach((p, i) => {
           const d = phones[i];
-          console.log(`   👤 ${p.id?._serialized || '?'} → tel=${d || '❌ sin resolver'} → país=${countryFromDigits(d) || '?'}`);
+          console.log(`   👤 ${p.id} → tel=${d || '❌ sin resolver'} → país=${countryFromDigits(d) || '?'}`);
         });
         const seen = new Set([baseCode]);
         const lines = [];
