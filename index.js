@@ -140,6 +140,10 @@ client.on('qr', qr => {
 let watchdogTimer = null;
 client.on('ready', () => {
   console.log('✅ Bot listo para funcionar');
+  try {
+    const libVer = JSON.parse(fs.readFileSync(path.join(__dirname, 'node_modules/whatsapp-web.js/package.json'), 'utf8')).version;
+    client.getWWebVersion().then(v => console.log(`ℹ️ whatsapp-web.js ${libVer} | WhatsApp Web ${v}`)).catch(() => {});
+  } catch (_) { /* noop */ }
   beat();
   if (watchdogTimer) return;
   watchdogTimer = setInterval(async () => {
@@ -196,7 +200,7 @@ setInterval(() => {
   for (const [k, v] of encuestaState) if (now - v.ts > STATE_TTL_MS) encuestaState.delete(k);
   for (const [k, t] of lastWelcomeAt) if (now - t > 60 * 60 * 1000) lastWelcomeAt.delete(k);
   for (const [k, t] of cooldowns) if (now - t > 60 * 1000) cooldowns.delete(k);
-  for (const [k, v] of adminCache) if (now - v.ts > ADMIN_STALE_MS) adminCache.delete(k);
+  for (const [k, v] of groupCache) if (now - v.ts > GROUP_STALE_MS) groupCache.delete(k);
 }, 5 * 60 * 1000).unref();
 
 // ================== Helpers ==================
@@ -247,41 +251,133 @@ async function ensureParticipants(chat) {
   return chat.participants || [];
 }
 
+// ---------- Lectura de grupos SIN getChat ----------
+// En algunas versiones de WhatsApp Web, getChat/getChatById/getChats fallan en grupos
+// (error "r"): el modelo del chat hace consultas extra que se rompen. Aquí leemos los
+// miembros directamente de la colección interna, sin esos pasos, y dejamos getChat de plan B.
+const withTimeout = (promise, ms, label) => Promise.race([
+  promise,
+  new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout (${label})`)), ms)),
+]);
+
+async function readGroupDirect(groupId) {
+  return withTimeout(client.pupPage.evaluate(async (gid) => {
+    const out = { participants: [], steps: [] };
+    const msgOf = e => String((e && e.message) || e);
+    try {
+      const cols = window.require('WAWebCollections');
+      const wid = window.require('WAWebWidFactory').createWid(gid);
+      let chat = cols.Chat.get(wid);
+      if (!chat) {
+        try { chat = (await window.require('WAWebFindChatAction').findOrCreateLatestChat(wid))?.chat; }
+        catch (e) { out.steps.push('find: ' + msgOf(e)); }
+      }
+      const md = chat && chat.groupMetadata;
+      if (!md) { out.error = 'el chat no tiene groupMetadata'; return out; }
+
+      let parts = [];
+      try { parts = md.serialize().participants || []; } catch (e) { out.steps.push('serialize: ' + msgOf(e)); }
+      if (!parts.length) {
+        try { parts = md.participants.getModelsArray ? md.participants.getModelsArray() : (md.participants.models || []); }
+        catch (e) { out.steps.push('models: ' + msgOf(e)); }
+      }
+
+      let toPn = null, getPn = null;
+      try { toPn = window.require('WAWebLidMigrationUtils').toPn; } catch (e) { out.steps.push('toPn: ' + msgOf(e)); }
+      try { getPn = window.require('WAWebApiContact').getPhoneNumber; } catch (e) { out.steps.push('getPhoneNumber: ' + msgOf(e)); }
+
+      for (const p of parts) {
+        const id = p.id;
+        const ser = id && id._serialized ? id._serialized : String(id);
+        let pn = null;
+        if (ser.endsWith('@lid')) {
+          try { const r = toPn ? toPn(id) : null; pn = r && r._serialized ? r._serialized : null; } catch (_) { /* noop */ }
+          if (!pn && getPn) { try { const r = getPn(id); pn = r && r._serialized ? r._serialized : null; } catch (_) { /* noop */ } }
+        }
+        out.participants.push({ id: ser, pn, isAdmin: !!p.isAdmin, isSuperAdmin: !!p.isSuperAdmin });
+      }
+    } catch (e) { out.error = msgOf(e); }
+    return out;
+  }, groupId), 20000, 'lectura directa del grupo');
+}
+
+// Devuelve participantes con la forma { id:{_serialized,user,server}, isAdmin, isSuperAdmin, pn } o null
+async function getGroupParticipants(groupId, msg) {
+  try {
+    const r = await readGroupDirect(groupId);
+    if (r && r.participants && r.participants.length) {
+      return r.participants.map(p => {
+        const [user, server] = p.id.split('@');
+        const d = p.pn ? String(p.pn).split('@')[0].replace(/\D/g, '') : '';
+        if (server === 'lid' && d) cacheLid(p.id, d);
+        return { id: { _serialized: p.id, user, server }, isAdmin: p.isAdmin, isSuperAdmin: p.isSuperAdmin, pn: p.pn || null };
+      });
+    }
+    console.error(`⚠️ Lectura directa del grupo sin miembros: ${r?.error || 'vacía'}${r?.steps?.length ? ' | ' + r.steps.join(' ; ') : ''}`);
+  } catch (e) {
+    console.error('⚠️ Lectura directa del grupo falló:', shortErr(e));
+  }
+  if (msg) { // plan B: la vía normal de la librería
+    const chat = await safeCall(() => msg.getChat(), 'getChat (plan B)', 2);
+    if (chat && chat.isGroup) {
+      const parts = await ensureParticipants(chat);
+      if (parts.length) return parts;
+    }
+  }
+  return null;
+}
+
+// Lista de grupos donde está el bot: [{ id, name }]
+async function listGroups() {
+  try {
+    const r = await withTimeout(client.pupPage.evaluate(async () => {
+      const cols = window.require('WAWebCollections');
+      const arr = cols.Chat.getModelsArray ? cols.Chat.getModelsArray() : (cols.Chat.models || []);
+      return arr
+        .filter(c => c.isGroup || (c.id && c.id.server === 'g.us'))
+        .map(c => ({ id: c.id._serialized, name: c.formattedTitle || c.name || c.id._serialized }));
+    }), 20000, 'listar grupos');
+    if (Array.isArray(r) && r.length) return r;
+  } catch (e) {
+    console.error('⚠️ Listado directo de grupos falló:', shortErr(e));
+  }
+  const chats = await safeCall(() => client.getChats(), 'getChats', 2);
+  return chats ? chats.filter(c => c.isGroup).map(c => ({ id: c.id._serialized, name: c.name })) : [];
+}
+
 // ---------- Admins del grupo (según WhatsApp) ----------
 // Se compara por ID exacto (@lid o @c.us) y por teléfono (últimos 10 dígitos), con caché:
 //  • 60 s de caché "fresca" para no consultar WhatsApp Web en cada comando
 //  • si WhatsApp Web falla, se usa la última lista conocida (hasta 15 min)
-const adminCache = new Map(); // chatId -> { ids:Set, phones:Set, ts }
-const ADMIN_FRESH_MS = 60 * 1000;
-const ADMIN_STALE_MS = 15 * 60 * 1000;
+const groupCache = new Map(); // chatId -> { parts, ids:Set, phones:Set, ts }
+const GROUP_FRESH_MS = 60 * 1000;
+const GROUP_STALE_MS = 15 * 60 * 1000;
 
-async function loadGroupAdmins(chat) {
-  const admins = (await ensureParticipants(chat)).filter(isAdminFlag);
-  const ids = new Set(admins.map(p => p?.id?._serialized).filter(Boolean));
-  const { numbers } = await participantNumbers(admins); // resuelve @lid → teléfono
-  const phones = new Set(numbers.map(toBase10).filter(x => x.length >= 7));
-  return { ids, phones, ts: Date.now() };
+async function getGroupInfo(msg) {
+  const chatId = msg.from;
+  const cached = groupCache.get(chatId);
+  if (cached && Date.now() - cached.ts <= GROUP_FRESH_MS) return cached;
+
+  const parts = await getGroupParticipants(chatId, msg);
+  if (parts && parts.length) {
+    const admins = parts.filter(isAdminFlag);
+    const ids = new Set(admins.map(p => p?.id?._serialized).filter(Boolean));
+    const { numbers } = await participantNumbers(admins);
+    const phones = new Set(numbers.map(toBase10).filter(x => x.length >= 7));
+    const info = { parts, ids, phones, ts: Date.now() };
+    groupCache.set(chatId, info);
+    return info;
+  }
+  if (cached && Date.now() - cached.ts <= GROUP_STALE_MS) {
+    console.log('ℹ️ WhatsApp Web no respondió; uso la lista del grupo en caché');
+    return cached;
+  }
+  return null;
 }
 
 async function checkGroupAdmin(msg) {
-  const chatId = msg.from;
-  let info = adminCache.get(chatId);
-
-  if (!info || Date.now() - info.ts > ADMIN_FRESH_MS) {
-    let loaded = null;
-    const chat = await safeCall(() => msg.getChat(), 'getChat (permisos)');
-    if (chat && chat.isGroup) {
-      try { loaded = await loadGroupAdmins(chat); } catch (e) { console.error('⚠️ No pude leer admins del grupo:', shortErr(e)); }
-    }
-    if (loaded && loaded.ids.size + loaded.phones.size > 0) {
-      adminCache.set(chatId, loaded);
-      info = loaded;
-    } else if (info && Date.now() - info.ts <= ADMIN_STALE_MS) {
-      console.log('ℹ️ WhatsApp Web no respondió; uso la lista de admins en caché');
-    } else {
-      return { ok: false, reason: 'no se pudo verificar admin del grupo (error de WhatsApp Web)' };
-    }
-  }
+  const info = await getGroupInfo(msg);
+  if (!info) return { ok: false, reason: 'no se pudo verificar admin del grupo (error de WhatsApp Web)' };
 
   const author = String(msg.author || '');
   if (author && info.ids.has(author)) return { ok: true, reason: 'admin del grupo' };
@@ -295,11 +391,7 @@ async function checkGroupAdmin(msg) {
 // Número (10 dígitos) del remitente. Barato si el id es @c.us; solo consulta el
 // contacto cuando WhatsApp lo identifica como @lid.
 async function senderBase10(msg) {
-  const raw = msg.author || msg.from;
-  if (!raw) return '';
-  if (!String(raw).endsWith('@lid')) return extractUserBase10(raw);
-  const contact = await msg.getContact().catch(() => null);
-  return contact?.number ? toBase10(contact.number) : '';
+  return toBase10(await senderFullNumber(msg));
 }
 const OWNER_SET = new Set([...(OWNER_NUMBER_BASE10 ? [OWNER_NUMBER_BASE10] : []), ...OWNER_EXTRA_NUMBERS]);
 function idMatches(msg, set) {
@@ -307,9 +399,16 @@ function idMatches(msg, set) {
   return [msg.author, msg.from].filter(Boolean)
     .some(c => set.has(String(c)) || set.has(String(c).split('@')[0]));
 }
+// Compatibilidad: OWNER_NUMBER/ADMIN_NUMBERS escritos con los dígitos del ID @lid (grupos y DMs)
+function lidTail(msg) {
+  const raw = String(msg.author || msg.from || '');
+  return raw.endsWith('@lid') ? toBase10(raw.split('@')[0]) : '';
+}
 async function isOwner(msg) {
   if (idMatches(msg, OWNER_IDS)) return true;
   if (!OWNER_SET.size) return false;
+  const tail = lidTail(msg);
+  if (tail && OWNER_SET.has(tail)) return true;
   return OWNER_SET.has(await senderBase10(msg));
 }
 
@@ -341,6 +440,13 @@ async function authorize(msg, isGroupMsg) {
 
   let num = '';
   if (OWNER_SET.size || ADMIN_NUMBERS.size) {
+    // Compatibilidad: si pusiste en OWNER_NUMBER/ADMIN_NUMBERS los dígitos de tu ID @lid
+    const tail = lidTail(msg);
+    if (tail) {
+      const lidId = String(msg.author || msg.from);
+      if (OWNER_SET.has(tail)) return { ok: true, reason: `owner (OWNER_NUMBER coincide con tu ID @lid; mejor usa OWNER_IDS=${lidId})` };
+      if (ADMIN_NUMBERS.has(tail)) return { ok: true, reason: `admin (ADMIN_NUMBERS coincide con tu ID @lid; mejor usa ADMIN_IDS=${lidId})` };
+    }
     num = await senderBase10(msg);
     if (num && OWNER_SET.has(num)) return { ok: true, reason: 'owner (por número)' };
     if (num && ADMIN_NUMBERS.has(num)) return { ok: true, reason: 'admin (por número)' };
@@ -415,30 +521,46 @@ function countryFromNumber(digits) {
   } catch (_) { return null; }
 }
 
-// Número completo (con código de país) de quien envía. Si WhatsApp lo oculta tras un @lid, se resuelve.
+// Número completo (con código de país) de quien envía. OJO: para IDs @lid, Contact.number
+// NO es el teléfono (es el propio ID), así que se resuelve por otras vías.
 const lidCache = new Map(); // lid -> dígitos del teléfono
 const cacheLid = (lid, d) => { if (lidCache.size > 5000) lidCache.clear(); lidCache.set(lid, d); };
+const digitsOf = v => String(v || '').split('@')[0].replace(/\D/g, '');
+
 async function senderFullNumber(msg) {
   const raw = String(msg.author || msg.from || '');
-  if (!raw.endsWith('@lid')) return raw.split('@')[0].replace(/\D/g, '');
+  if (!raw) return '';
+  if (!raw.endsWith('@lid')) return digitsOf(raw);
   if (lidCache.has(raw)) return lidCache.get(raw);
+
+  let d = '';
   const contact = await msg.getContact().catch(() => null);
-  let d = contact?.number ? String(contact.number).replace(/\D/g, '') : '';
+  const cid = contact && contact.id;
+  if (cid && cid.server === 'c.us' && cid.user) d = digitsOf(cid.user); // contacto con teléfono conocido
+  if (!d && contact?.number) { // solo si NO es simplemente el propio ID @lid
+    const n = digitsOf(contact.number);
+    if (n && n !== digitsOf(raw)) d = n;
+  }
   if (!d) {
     const res = await safeCall(() => client.getContactLidAndPhone([raw]), 'resolver @lid del remitente', 1);
-    if (res?.[0]?.pn) d = String(res[0].pn).split('@')[0].replace(/\D/g, '');
+    if (res?.[0]?.pn) d = digitsOf(res[0].pn);
   }
   if (d) cacheLid(raw, d);
   return d;
 }
 
-// Teléfonos de todos los participantes. Los @lid se resuelven por lotes (con caché).
+// Teléfonos de todos los participantes. Usa p.pn si ya viene; los @lid restantes se resuelven por lotes (con caché).
 async function participantNumbers(participants) {
   const numbers = [];
   const pending = [];
   for (const p of participants || []) {
     const ser = p?.id?._serialized || '';
-    if (ser.endsWith('@lid') || p?.id?.server === 'lid') {
+    const isLid = ser.endsWith('@lid') || p?.id?.server === 'lid';
+    if (p?.pn) {
+      const d = digitsOf(p.pn);
+      if (d) { numbers.push(d); if (isLid && ser) cacheLid(ser, d); continue; }
+    }
+    if (isLid) {
       const lid = ser || `${p.id.user}@lid`;
       if (lidCache.has(lid)) numbers.push(lidCache.get(lid)); else pending.push(lid);
     } else {
@@ -451,8 +573,7 @@ async function participantNumbers(participants) {
     const chunk = pending.slice(i, i + 40);
     const res = await safeCall(() => client.getContactLidAndPhone(chunk), 'resolver @lid de participantes', 2);
     chunk.forEach((lid, idx) => {
-      const pn = res?.[idx]?.pn;
-      const d = pn ? String(pn).split('@')[0].replace(/\D/g, '') : '';
+      const d = res?.[idx]?.pn ? digitsOf(res[idx].pn) : '';
       if (d) { cacheLid(lid, d); numbers.push(d); } else unresolved++;
     });
   }
@@ -586,9 +707,8 @@ client.on('message', async msg => {
           if (!/^\d{2}:\d{2}$/.test(text) || !DateTime.fromFormat(text, 'HH:mm').isValid)
             return msg.reply('⛔ Hora inválida. Usa HH:MM en 24h, ej. 20:00');
           state.hora = text;
-          const allChats = await client.getChats();
           // Guardamos solo id + nombre (no objetos Chat completos)
-          state.groups = allChats.filter(c => c.isGroup).map(c => ({ id: c.id._serialized, name: c.name }));
+          state.groups = await listGroups();
           if (!state.groups.length) {
             encuestaState.delete(msg.from);
             return msg.reply('⚠️ No estoy en ningún grupo para enviar la encuesta.');
@@ -606,13 +726,11 @@ client.on('message', async msg => {
             : state.groups.find(g => normCmd(g.name) === normCmd(text));
           if (!target) return msg.reply('⛔ No encontré ese grupo. Responde con número o nombre exacto.');
 
-          const targetChat = await safeCall(() => client.getChatById(target.id), 'getChatById (encuesta)');
-
           // Resumen de horarios locales (según prefijo telefónico de los miembros)
           const baseTime = DateTime.fromFormat(
             `${state.fecha} ${state.hora}`, 'dd/MM/yyyy HH:mm', { zone: 'America/Mexico_City' }
           );
-          const parts = targetChat ? await ensureParticipants(targetChat) : [];
+          const parts = (await getGroupParticipants(target.id, null)) || [];
           const { numbers } = await participantNumbers(parts);
           const { groups } = convertToZones(numbers, baseTime);
           let tzSummary = '🕒 Horarios locales:\n';
@@ -755,6 +873,9 @@ client.on('message', async msg => {
         return msg.reply('⛔ Hora inválida. Usa formato 24h como *20:00* 🕒');
       }
 
+      // Leer el grupo primero: así los @lid de los miembros (incluido el remitente) ya traen su teléfono
+      const info = isGroupMsg ? await getGroupInfo(msg) : null;
+
       // 1) ¿En qué zona está la hora que escribió?
       let baseIso = null;
       let whoTxt = 'hora de quien consulta';
@@ -778,9 +899,8 @@ client.on('message', async msg => {
       // 2) Conversión para todos los miembros del grupo
       let groups = [], unknown = 0, couldRead = true;
       if (isGroupMsg) {
-        const chat = await safeCall(() => msg.getChat(), 'getChat (hora)', 2);
-        if (chat) {
-          const { numbers, unresolved } = await participantNumbers(await ensureParticipants(chat));
+        if (info) {
+          const { numbers, unresolved } = await participantNumbers(info.parts);
           const r = convertToZones(numbers, baseTime);
           groups = r.groups;
           unknown = r.unknown + unresolved;
@@ -909,6 +1029,9 @@ console.log('⚙️ Config → ' + [
   `PUBLIC_COMMANDS=${PUBLIC_COMMANDS}`,
   `ALLOW_GROUP_ADMINS=${ALLOW_GROUP_ADMINS}`,
 ].join(' | '));
+if (!OWNER_IDS.size && !ADMIN_IDS.size) {
+  console.warn('⚠️ OWNER_IDS y ADMIN_IDS están VACÍOS. Si ya las definiste en Portainer, tu docker-compose no las pasa al contenedor: agrega en "environment" las líneas  - OWNER_IDS=${OWNER_IDS:-}  y  - ADMIN_IDS=${ADMIN_IDS:-}');
+}
 if (!OWNER_IDS.size && !ADMIN_IDS.size && !OWNER_SET.size && !ADMIN_NUMBERS.size) {
   console.warn('⚠️ No hay NADIE en la lista (OWNER_*/ADMIN_*): el bot ignorará todos los comandos. ¿Las variables llegan al contenedor?');
 }
