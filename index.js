@@ -324,19 +324,39 @@ async function getGroupMembers(chatId) {
   // 1) Directo del Store de WhatsApp Web
   if (client.pupPage) {
     try {
-      const list = await client.pupPage.evaluate(async id => {
-        if (!window.Store || !window.Store.WidFactory) return null; // Store no inyectado
-        const wid = window.Store.WidFactory.createWid(id);
-        let meta = window.Store.GroupMetadata?.get?.(wid) || window.Store.Chat?.get?.(wid)?.groupMetadata;
-        if (!meta && window.Store.GroupMetadata?.find) meta = await window.Store.GroupMetadata.find(wid);
-        const raw = meta?.participants;
+      const res = await client.pupPage.evaluate(async id => {
+        // Obtener los módulos: primero window.Store, si no, directo con window.require
+        let S = null;
+        if (window.Store && window.Store.WidFactory) {
+          S = window.Store;
+        } else if (typeof window.require === 'function') {
+          try {
+            const cols = window.require('WAWebCollections');
+            S = {
+              WidFactory: window.require('WAWebWidFactory'),
+              GroupMetadata: cols.GroupMetadata,
+              Chat: cols.Chat,
+            };
+          } catch (e) { return { err: 'require falló: ' + (e && e.message) }; }
+        }
+        if (!S || !S.WidFactory) return { err: 'no hay window.Store ni window.require' };
+
+        const wid = S.WidFactory.createWid(id);
+        let meta = S.GroupMetadata?.get?.(wid) || S.Chat?.get?.(wid)?.groupMetadata;
+        if (!meta && S.GroupMetadata?.find) meta = await S.GroupMetadata.find(wid);
+        if (!meta) return { err: 'metadata del grupo no encontrada' };
+
+        const raw = meta.participants;
         const parts = raw?.getModelsArray ? raw.getModelsArray() : (Array.isArray(raw) ? raw : []);
-        return parts.map(p => ({
-          id: p.id?._serialized || null,
-          pn: p.phoneNumber?._serialized || p.pn?._serialized || null,
-        })).filter(p => p.id);
+        return {
+          list: parts.map(p => ({
+            id: p.id?._serialized || null,
+            pn: p.phoneNumber?._serialized || p.pn?._serialized || null,
+          })).filter(p => p.id),
+        };
       }, chatId);
-      if (Array.isArray(list) && list.length) return list;
+      if (res?.list?.length) return res.list;
+      console.error(`⚠️ getGroupMembers (Store): ${res?.err || 'lista vacía'}`);
     } catch (e) {
       console.error(`⚠️ getGroupMembers (Store) falló: ${shortErr(e)}`);
     }
