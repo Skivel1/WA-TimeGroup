@@ -244,11 +244,16 @@ async function isOwner(msg) {
   return false;
 }
 
-async function canRunAdminCmd(msg, isGroupMsg) {
-  if (await isOwner(msg)) return true;
-  if (!isGroupMsg) return false;
-  const chat = await msg.getChat();
-  return isSenderAdminInGroup(chat, msg);
+async function canRunAdminCmd(msg) {
+  try {
+    const chat = await msg.getChat(); // O client.getChatById(...)
+    if (!chat.isGroup) return false;
+    
+    // Tu lógica actual de verificación de admin...
+  } catch (error) {
+    console.error("Error obteniendo el chat:", error.message);
+    return false; // Si falla la consulta del chat, deniega temporalmente el comando sin romper el bot
+  }
 }
 
 // Matching de comandos (case/acentos/espacios)
