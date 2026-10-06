@@ -15,6 +15,9 @@ const SESSION_PATH = path.join(DATA_DIR, '.wwebjs_auth');
 const CACHE_PATH = path.join(DATA_DIR, '.wwebjs_cache');
 const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE || '/tmp/skibot-heartbeat';
 const LOG_MESSAGES = process.env.LOG_MESSAGES === 'true'; // loguear TODOS los mensajes (debug)
+// Por defecto SOLO la lista (owner/admins) puede usar comandos; el resto se ignora en silencio.
+const PUBLIC_COMMANDS = process.env.PUBLIC_COMMANDS === 'true';       // true = !comandos, !link gremio, etc. abiertos a todos
+const ALLOW_GROUP_ADMINS = process.env.ALLOW_GROUP_ADMINS === 'true'; // true = también admins del grupo según WhatsApp
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 3000);
 const WATCHDOG_MS = 5 * 60 * 1000;
 
@@ -26,6 +29,11 @@ const OWNER_NUMBER_BASE10 = toBase10(process.env.OWNER_NUMBER || '');
 const ADMIN_NUMBERS = new Set(
   (process.env.ADMIN_NUMBERS || '').split(',').map(toBase10).filter(x => x.length >= 7)
 );
+// IDs exactos (útiles cuando WhatsApp te identifica como xxxx@lid en grupos).
+// Obtén el tuyo escribiendo !id en el grupo. Separados por coma.
+const parseIds = v => new Set((v || '').split(',').map(x => x.trim()).filter(Boolean));
+const OWNER_IDS = parseIds(process.env.OWNER_IDS);
+const ADMIN_IDS = parseIds(process.env.ADMIN_IDS);
 if (!OWNER_NUMBER_BASE10) {
   console.warn('⚠️ OWNER_NUMBER no está definido: nadie tendrá permisos de owner.');
 }
@@ -268,21 +276,26 @@ async function isSenderAdminInGroup(chat, msg) {
   return senderBases.some(b => adminSet.has(b));
 }
 
-// ¿El remitente coincide con alguno de estos números? Chequeo barato primero;
-// solo si el id es @lid consulta el contacto.
-async function senderMatches(msg, numbers) {
-  if (!numbers.size) return false;
-  const candidates = [msg.author, msg.from].filter(Boolean);
-  if (candidates.some(c => numbers.has(extractUserBase10(c)))) return true;
-  if (candidates.some(c => String(c).endsWith('@lid'))) {
-    const contact = await msg.getContact().catch(() => null);
-    if (contact?.number && numbers.has(toBase10(contact.number))) return true;
-  }
-  return false;
+// Número (10 dígitos) del remitente. Barato si el id es @c.us; solo consulta el
+// contacto cuando WhatsApp lo identifica como @lid.
+async function senderBase10(msg) {
+  const raw = msg.author || msg.from;
+  if (!raw) return '';
+  if (!String(raw).endsWith('@lid')) return extractUserBase10(raw);
+  const contact = await msg.getContact().catch(() => null);
+  return contact?.number ? toBase10(contact.number) : '';
 }
 const OWNER_SET = new Set(OWNER_NUMBER_BASE10 ? [OWNER_NUMBER_BASE10] : []);
-const STAFF_SET = new Set([...OWNER_SET, ...ADMIN_NUMBERS]);
-const isOwner = msg => senderMatches(msg, OWNER_SET);
+function idMatches(msg, set) {
+  if (!set.size) return false;
+  return [msg.author, msg.from].filter(Boolean)
+    .some(c => set.has(String(c)) || set.has(String(c).split('@')[0]));
+}
+async function isOwner(msg) {
+  if (idMatches(msg, OWNER_IDS)) return true;
+  if (!OWNER_SET.size) return false;
+  return OWNER_SET.has(await senderBase10(msg));
+}
 
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 const shortErr = e => String((e && (e.message || e)) || 'error desconocido').split('\n')[0].slice(0, 200);
@@ -304,21 +317,29 @@ async function safeCall(fn, label, tries = 3) {
   return null;
 }
 
-// true = puede, false = no puede, null = no se pudo verificar (error de WhatsApp Web)
-async function canRunAdminCmd(msg, isGroupMsg) {
-  if (await senderMatches(msg, STAFF_SET)) return true; // owner o ADMIN_NUMBERS
-  if (!isGroupMsg) return false;
-  const chat = await safeCall(() => msg.getChat(), 'getChat (permisos)');
-  if (!chat) return null;
-  try {
-    return await isSenderAdminInGroup(chat, msg);
-  } catch (e) {
-    console.error('⚠️ Verificación de admin falló:', shortErr(e));
-    return null;
-  }
-}
+// Decide si el remitente está en la lista. Devuelve { ok, reason }.
+// Orden: IDs exactos → números → (opcional) admins del grupo según WhatsApp.
+async function authorize(msg, isGroupMsg) {
+  if (idMatches(msg, OWNER_IDS)) return { ok: true, reason: 'owner (OWNER_IDS)' };
+  if (idMatches(msg, ADMIN_IDS)) return { ok: true, reason: 'admin (ADMIN_IDS)' };
 
-const MSG_NO_VERIFY = '⚠️ No pude verificar tus permisos en este momento. Intenta de nuevo en un minuto.';
+  if (OWNER_SET.size || ADMIN_NUMBERS.size) {
+    const num = await senderBase10(msg);
+    if (num && OWNER_SET.has(num)) return { ok: true, reason: 'owner (OWNER_NUMBER)' };
+    if (num && ADMIN_NUMBERS.has(num)) return { ok: true, reason: 'admin (ADMIN_NUMBERS)' };
+  }
+
+  if (ALLOW_GROUP_ADMINS && isGroupMsg) {
+    const chat = await safeCall(() => msg.getChat(), 'getChat (permisos)');
+    if (!chat) return { ok: false, reason: 'no se pudo verificar admin del grupo (error de WhatsApp Web)' };
+    try {
+      if (await isSenderAdminInGroup(chat, msg)) return { ok: true, reason: 'admin del grupo' };
+    } catch (e) {
+      return { ok: false, reason: `no se pudo verificar admin del grupo (${shortErr(e)})` };
+    }
+  }
+  return { ok: false, reason: 'no está en la lista de owner/admins' };
+}
 
 // Matching de comandos (case/acentos/espacios)
 function normCmd(s) {
@@ -366,16 +387,34 @@ client.on('message', async msg => {
     const isGroupMsg = msg.from.endsWith('@g.us');
     const inFlow = !isGroupMsg && encuestaState.has(msg.from);
 
-    if (LOG_MESSAGES) console.log(`📥 [${new Date().toLocaleString()}] ${senderLabel(msg)}: "${rawBody}"`);
+    if (LOG_MESSAGES) console.log(`📥 [${new Date().toLocaleString()}] ${senderLabel(msg)} | ID: ${msg.author || msg.from} | ${msg.from}: "${rawBody}"`);
 
     // El 95% de los mensajes de grupo termina aquí
     if (!inFlow && !COMMAND_START.test(normCmd(rawBody))) return;
 
     const who = senderLabel(msg);
+    const senderId = msg.author || msg.from;
+    const preview = rawBody.replace(/\s+/g, ' ').slice(0, 60);
+
+    // ============ Control de acceso (solo para comandos) ============
+    if (!inFlow) {
+      const adminOnly = isCmd(rawBody, ['!skibot', '!encuesta roles', '!encuesta']);
+      const auth = await authorize(msg, isGroupMsg);
+      const where = isGroupMsg ? `grupo ${msg.from}` : 'DM';
+      console.log(`📩 ${who} | ID: ${senderId} | ${where} | "${preview}" → ${auth.ok ? '✅ autorizado: ' + auth.reason : '❌ ' + auth.reason}`);
+
+      if (!auth.ok && (adminOnly || !PUBLIC_COMMANDS)) {
+        console.log(`⛔ IGNORADO: ${senderId} (${who}) no es admin/owner → sin respuesta`);
+        return;
+      }
+    }
 
     // ============ DM: !encuesta (SOLO OWNER) ============
     if (!isGroupMsg && isCmd(rawBody, ['!encuesta'])) {
-      if (!(await isOwner(msg))) return;
+      if (!(await isOwner(msg))) {
+        console.log(`⛔ IGNORADO: ${senderId} puede ser admin pero !encuesta por DM es solo para el owner`);
+        return;
+      }
       encuestaState.set(msg.from, { step: 'askType', ts: Date.now() });
       return msg.reply('📋 ¿Qué tipo de encuesta quieres crear? (p.e. *Scrim*)\n\n_Escribe *cancelar* para salir._');
     }
@@ -479,11 +518,14 @@ client.on('message', async msg => {
       return;
     }
 
+    // ============ !id (para configurar OWNER_IDS / ADMIN_IDS) ============
+    if (isCmd(rawBody, ['!id'])) {
+      if (onCooldown(msg, 'id')) return;
+      return msg.reply(`🆔 *Tu ID:* ${msg.author || msg.from}\n💬 *Chat:* ${msg.from}`);
+    }
+
     // ============ !skibot (admins/owner) ============
     if (isCmd(rawBody, ['!skibot'])) {
-      const ok = await canRunAdminCmd(msg, isGroupMsg);
-      if (ok === null) return msg.reply(MSG_NO_VERIFY);
-      if (!ok) return;
       const now = new Date();
       const horaLocal = now.toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
       await msg.reply(
@@ -498,9 +540,6 @@ client.on('message', async msg => {
 
     // ============ !encuesta roles (admins/owner) ============
     if (isCmd(rawBody, ['!encuesta roles'])) {
-      const ok = await canRunAdminCmd(msg, isGroupMsg);
-      if (ok === null) return msg.reply(MSG_NO_VERIFY);
-      if (!ok) return;
       const title = '🎮 *¿Qué línea juegas más frecuentemente?*';
       const options = [
         '🗡️ Top – El reino del 1v1 eterno.',
