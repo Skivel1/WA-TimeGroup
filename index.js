@@ -851,7 +851,7 @@ client.on('message', async msg => {
     }
     if (isCmd(rawBody, ['!discord gremio', '!discord del gremio'])) {
       if (onCooldown(msg, 'discord')) return;
-      await msg.reply('💬 Enlace del Discord del gremio: https://discord.gg/M4aAtt8a7T 🎧🛡️');
+      await msg.reply('💬 Enlace del Discord del gremio: https://discord.gg/Y72AETPq5 🎧🛡️');
       return;
     }
 
