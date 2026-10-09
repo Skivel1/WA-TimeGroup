@@ -669,6 +669,35 @@ client.on('message', async msg => {
       }
     }
 
+  // Detecta "!me mide" sin importar mayúsculas/minúsculas o espacios extra
+  if (/^!me\s+mide$/i.test(body)) {
+    try {
+      // Obtener el contacto de quien envió el mensaje para mencionarlo
+      const contact = await msg.getContact();
+      
+      // Número al azar del 1 al 40
+      const randomCm = Math.floor(Math.random() * 40) + 1;
+
+      let responseText = '';
+
+      if (randomCm > 30) {
+        responseText = `⚡ @${contact.id.user} ¡¡NO LE CABE EN EL PANTALÓN DE TANTO PODER!! 😱💥🔥\n\n🍆 Tiene **${randomCm} cm DE PODER** 📐🚀`;
+      } else {
+        responseText = `📏 A @${contact.id.user} le mide **${randomCm} cm DE PODER** ⚡😏✨`;
+      }
+
+      // Responder mencionando al usuario
+      await msg.reply(responseText, null, {
+        mentions: [contact]
+      });
+
+    } catch (error) {
+      console.error('Error en comando !me mide:', error.message);
+    }
+  }
+}
+
+
     // ============ DM: !encuesta (SOLO OWNER) ============
     if (!isGroupMsg && isCmd(rawBody, ['!encuesta'])) {
       if (!(await isOwner(msg))) {
