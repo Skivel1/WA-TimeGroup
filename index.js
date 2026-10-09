@@ -673,6 +673,84 @@ client.on('message', async msg => {
       }
       return;
     }
+    
+        // ============ Comandos divertidos ============
+    const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+
+    // !rol
+    if (isCmd(rawBody, ['!rol', '!linea'])) {
+      if (onCooldown(msg, 'rol')) return;
+      const contact = await msg.getContact();
+      const roles = [
+        '🗡️ *Top*: 1v1 eterno, nadie te va a ayudar.',
+        '🐊 *Jungla*: ganks o llorar.',
+        '🧙‍♂️ *Mid*: la línea de los que se creen protagonistas.',
+        '🏹 *ADC*: mucho daño, cero vida. Reza por tu soporte.',
+        '🛡️ *Soporte*: ver todo el mapa y que nadie te agradezca.',
+      ];
+      return msg.reply(`🎲 @${contact.id.user} hoy te toca:\n\n${pick(roles)}`, undefined, { mentions: [contact] });
+    }
+
+    // !campeon
+    if (isCmd(rawBody, ['!campeon', '!champ'])) {
+      if (onCooldown(msg, 'campeon')) return;
+      const contact = await msg.getContact();
+      const champs = ['Yasuo', 'Teemo', 'Lux', 'Jinx', 'Garen', 'Lee Sin', 'Ahri', 'Vayne', 'Yuumi', 'Darius', 'Ezreal', 'Blitzcrank', 'Kayn', 'Akali', 'Soraka', 'Zed'];
+      return msg.reply(`🦸 @${contact.id.user}, tu campeón obligatorio de hoy es *${pick(champs)}*. Sin cambios, sin llorar. 😤`, undefined, { mentions: [contact] });
+    }
+
+    // !tilt
+    if (isCmd(rawBody, ['!tilt'])) {
+      if (onCooldown(msg, 'tilt')) return;
+      const contact = await msg.getContact();
+      const n = Math.floor(Math.random() * 101);
+      const frase = n < 25 ? 'Zen total. Pareces monje. 🧘'
+        : n < 50 ? 'Aguantas, pero ya te tembló el dedo. 😅'
+        : n < 75 ? 'Estás a una muerte de escribir "gg report". 😬'
+        : n < 95 ? 'Ya culpaste al ping, al equipo y a tu celular. 📱🔥'
+        : 'Desinstalando el juego en 3, 2, 1... 💀';
+      return msg.reply(`😡 Nivel de tilt de @${contact.id.user}: *${n}%*\n${frase}`, undefined, { mentions: [contact] });
+    }
+
+    // !excusa
+    if (isCmd(rawBody, ['!excusa'])) {
+      if (onCooldown(msg, 'excusa')) return;
+      const excusas = [
+        'Se me congeló el celular justo en la pelea. 🥶',
+        'Mi equipo no sabía jugar, yo estaba carreando. 🙄',
+        'El ping estaba en 999 y nadie me cree. 📶',
+        'Iba ganando línea, pero el jungla nunca apareció. 🐊',
+        'Mi gato pisó la pantalla. 🐱',
+        'Estaba probando una build experimental. 🧪',
+        'Me dio sueño en el minuto 12. 😴',
+      ];
+      return msg.reply(`📝 *Excusa oficial:*\n${pick(excusas)}`);
+    }
+
+    // !duo (solo en grupos)
+    if (isCmd(rawBody, ['!duo'])) {
+      if (!isGroupMsg) return;
+      if (onCooldown(msg, 'duo')) return;
+      const info = await getGroupInfo(msg);
+      if (!info) return msg.reply('⚠️ No pude leer los miembros del grupo, intenta en un minuto.');
+      const me = String(msg.author || '');
+      const candidatos = info.parts
+        .map(p => p.id._serialized)
+        .filter(id => id !== me && id !== client.info?.wid?._serialized);
+      if (!candidatos.length) return;
+      try {
+        const yo = await msg.getContact();
+        const otro = await client.getContactById(pick(candidatos));
+        const porcentaje = Math.floor(Math.random() * 101);
+        return msg.reply(
+          `💞 Tu dúo de hoy: @${yo.id.user} + @${otro.id.user}\n🤝 Compatibilidad: *${porcentaje}%*`,
+          undefined, { mentions: [yo, otro] }
+        );
+      } catch (e) {
+        console.error('Error en !duo:', shortErr(e));
+      }
+      return;
+    }
 
     // ============ Control de acceso (solo para comandos) ============
     if (!inFlow) {
