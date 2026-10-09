@@ -654,6 +654,26 @@ client.on('message', async msg => {
     const senderId = msg.author || msg.from;
     const preview = rawBody.replace(/\s+/g, ' ').slice(0, 60);
 
+    // ============ Comandos PÚBLICOS (cualquiera, sin control de acceso) ============
+    // Van ANTES del control de acceso, así que los puede usar todo el mundo.
+    if (!inFlow && /^!me mide$/.test(normCmd(rawBody))) {
+      if (onCooldown(msg, 'memide')) return;
+      try {
+        const contact = await msg.getContact();
+        const randomCm = Math.floor(Math.random() * 40) + 1; // 1 a 40
+
+        const responseText = randomCm > 30
+          ? `⚡ @${contact.id.user} ¡¡NO LE CABE EN EL PANTALÓN DE TANTO PODER!! 😱💥🔥\n\n🍆 Tiene *${randomCm} cm DE PODER* 📐🚀`
+          : `📏 A @${contact.id.user} le mide *${randomCm} cm DE PODER* ⚡😏✨`;
+
+        await msg.reply(responseText, undefined, { mentions: [contact] });
+        console.log(`📏 !me mide → ${who} (${randomCm} cm)`);
+      } catch (error) {
+        console.error('Error en comando !me mide:', shortErr(error));
+      }
+      return;
+    }
+
     // ============ Control de acceso (solo para comandos) ============
     if (!inFlow) {
       const adminOnly = isCmd(rawBody, ['!skibot', '!encuesta roles', '!encuesta']);
@@ -668,35 +688,6 @@ client.on('message', async msg => {
         return;
       }
     }
-
-  // Detecta "!me mide" sin importar mayúsculas/minúsculas o espacios extra
-  if (/^!me\s+mide$/i.test(body)) {
-    try {
-      // Obtener el contacto de quien envió el mensaje para mencionarlo
-      const contact = await msg.getContact();
-      
-      // Número al azar del 1 al 40
-      const randomCm = Math.floor(Math.random() * 40) + 1;
-
-      let responseText = '';
-
-      if (randomCm > 30) {
-        responseText = `⚡ @${contact.id.user} ¡¡NO LE CABE EN EL PANTALÓN DE TANTO PODER!! 😱💥🔥\n\n🍆 Tiene **${randomCm} cm DE PODER** 📐🚀`;
-      } else {
-        responseText = `📏 A @${contact.id.user} le mide **${randomCm} cm DE PODER** ⚡😏✨`;
-      }
-
-      // Responder mencionando al usuario
-      await msg.reply(responseText, null, {
-        mentions: [contact]
-      });
-
-    } catch (error) {
-      console.error('Error en comando !me mide:', error.message);
-    }
-  }
-}
-
 
     // ============ DM: !encuesta (SOLO OWNER) ============
     if (!isGroupMsg && isCmd(rawBody, ['!encuesta'])) {
@@ -862,6 +853,9 @@ client.on('message', async msg => {
 
 5. *Encuesta de Roles (solo admins)* 📊
    ➤ Comando: \`!encuesta roles\`
+
+6. *¿Cuánto te mide? (para todos)* 📏
+   ➤ Comando: \`!me mide\`
 
 ℹ️ Puedes escribir *!comandos*, *!cmd* o *!comando* para ver esta lista.`);
       return;
