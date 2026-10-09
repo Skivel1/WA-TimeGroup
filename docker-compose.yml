@@ -20,6 +20,7 @@ services:
       - BOT_NAME=${BOT_NAME:-Skibot}
       - TZ=${TZ:-America/Mexico_City}
       - LOG_MESSAGES=${LOG_MESSAGES:-false}
+      - RESTART_EVERY_HOURS=${RESTART_EVERY_HOURS:-0}
     volumes:
       - skibot_data:/app/data
     deploy:

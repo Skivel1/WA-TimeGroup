@@ -28,7 +28,7 @@ const botStartTime = new Date();
 const OWNER_NUMBER_BASE10 = toBase10(process.env.OWNER_NUMBER || '');
 // Listas por variable de entorno. Se acepta separar con coma, punto y coma o espacios,
 // y entradas con comillas. Cada entrada puede ser:
-//   • un ID exacto  → 50337134186514@lid   (o solo 50337134186514)
+//   • un ID exacto  → 123456789012345@lid   (o solo 123456789012345)
 //   • un teléfono   → 528123456789          (se compara contra el número del remitente)
 const splitList = v => String(v || '').split(/[,;\s]+/)
   .map(x => x.trim().replace(/^["']+|["']+$/g, '')).filter(Boolean);
@@ -137,6 +137,28 @@ client.on('qr', qr => {
   console.log('🔄 Escanea el código QR con tu WhatsApp');
 });
 
+// Si Chromium o la página caen pero Node sigue vivo, el bot "deja de responder" sin avisar:
+// salimos para que Docker lo reinicie (la sesión se conserva).
+let hooksAttached = false;
+function attachBrowserHooks() {
+  if (hooksAttached) return;
+  hooksAttached = true;
+  try {
+    client.pupBrowser?.on('disconnected', () => { console.error('💥 Chromium se cerró o cayó'); shutdown(1); });
+    client.pupPage?.on('close', () => { console.error('💥 La página de WhatsApp Web se cerró'); shutdown(1); });
+    client.pupPage?.on('error', e => { console.error('💥 La página de WhatsApp Web crasheó:', shortErr(e)); shutdown(1); });
+  } catch (e) {
+    console.error('⚠️ No pude enganchar eventos del navegador:', shortErr(e));
+  }
+}
+
+// Reinicio limpio programado (opcional): RESTART_EVERY_HOURS=24. Libera memoria y sale de estados "zombi".
+const RESTART_EVERY_HOURS = Number(process.env.RESTART_EVERY_HOURS || 0);
+if (RESTART_EVERY_HOURS > 0) {
+  setTimeout(() => { console.log(`🔁 Reinicio programado (cada ${RESTART_EVERY_HOURS} h)`); shutdown(0); },
+    RESTART_EVERY_HOURS * 3600 * 1000).unref();
+}
+
 let watchdogTimer = null;
 client.on('ready', () => {
   console.log('✅ Bot listo para funcionar');
@@ -145,6 +167,7 @@ client.on('ready', () => {
     client.getWWebVersion().then(v => console.log(`ℹ️ whatsapp-web.js ${libVer} | WhatsApp Web ${v}`)).catch(() => {});
   } catch (_) { /* noop */ }
   beat();
+  attachBrowserHooks();
   if (watchdogTimer) return;
   watchdogTimer = setInterval(async () => {
     try {
@@ -163,8 +186,15 @@ client.on('ready', () => {
 
 client.on('disconnected', reason => {
   console.error('🔌 Desconectado de WhatsApp:', reason);
+  if (String(reason).toUpperCase() === 'LOGOUT') {
+    console.error('   ⚠️ WhatsApp CERRÓ la sesión de este dispositivo vinculado (la sesión se borra y pedirá QR de nuevo).');
+    console.error('   Causas típicas: otra instancia usando la MISMA sesión (otro contenedor, el bot de Windows, una carpeta .wwebjs_auth copiada),');
+    console.error('   o el dispositivo fue eliminado desde WhatsApp → Dispositivos vinculados en el teléfono.');
+  }
   shutdown(1);
 });
+client.on('authenticated', () => console.log('🔑 Sesión autenticada'));
+client.on('change_state', st => console.log(`🔄 Estado de WhatsApp: ${st}`));
 client.on('auth_failure', m => {
   console.error('🔐 Fallo de autenticación:', m);
   shutdown(1);
@@ -634,6 +664,147 @@ function senderLabel(msg) {
   return msg._data?.notifyName || extractUserBase10(msg.author || msg.from) || 'Usuario';
 }
 
+// ================== Comandos de diversión (PÚBLICOS) ==================
+// Los puede usar CUALQUIERA (no pasan por el control de acceso). Si falla getContact,
+// se responde igual, sin mención.
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+async function mentionOf(msg, who) {
+  try {
+    const contact = await msg.getContact();
+    return { contact, tag: `@${contact.id.user}` };
+  } catch (_) {
+    return { contact: null, tag: `*${who}*` };
+  }
+}
+function replyWith(msg, text, contacts) {
+  const list = (contacts || []).filter(Boolean);
+  return msg.reply(text, undefined, list.length ? { mentions: list } : {});
+}
+
+const ROLES = [
+  '🗡️ *Top*: 1v1 eterno, nadie te va a ayudar.',
+  '🐊 *Jungla*: ganks o llorar.',
+  '🧙‍♂️ *Mid*: la línea de los que se creen protagonistas.',
+  '🏹 *ADC*: mucho daño, cero vida. Reza por tu soporte.',
+  '🛡️ *Soporte*: ver todo el mapa y que nadie te agradezca.',
+];
+const CHAMPS = ['Yasuo', 'Teemo', 'Lux', 'Jinx', 'Garen', 'Lee Sin', 'Ahri', 'Vayne', 'Yuumi', 'Darius', 'Ezreal', 'Blitzcrank', 'Kayn', 'Akali', 'Soraka', 'Zed'];
+const EXCUSAS = [
+  'Se me congeló el celular justo en la pelea. 🥶',
+  'Mi equipo no sabía jugar, yo estaba carreando. 🙄',
+  'El ping estaba en 999 y nadie me cree. 📶',
+  'Iba ganando línea, pero el jungla nunca apareció. 🐊',
+  'Mi gato pisó la pantalla. 🐱',
+  'Estaba probando una build experimental. 🧪',
+  'Me dio sueño en el minuto 12. 😴',
+];
+
+const FUN_COMMANDS = [
+  {
+    key: 'memide', aliases: ['!me mide'],
+    run: async ({ msg, who }) => {
+      const { contact, tag } = await mentionOf(msg, who);
+      const cm = randInt(1, 40);
+      const text = cm > 30
+        ? `⚡ ${tag} ¡¡NO LE CABE EN EL PANTALÓN DE TANTO PODER!! 😱💥🔥\n\n🍆 Tiene *${cm} cm DE PODER* 📐🚀`
+        : `📏 A ${tag} le mide *${cm} cm DE PODER* ⚡😏✨`;
+      return replyWith(msg, text, [contact]);
+    },
+  },
+  {
+    key: 'rol', aliases: ['!rol', '!linea'],
+    run: async ({ msg, who }) => {
+      const { contact, tag } = await mentionOf(msg, who);
+      return replyWith(msg, `🎲 ${tag} hoy te toca:\n\n${pick(ROLES)}`, [contact]);
+    },
+  },
+  {
+    key: 'campeon', aliases: ['!campeon', '!champ'],
+    run: async ({ msg, who }) => {
+      const { contact, tag } = await mentionOf(msg, who);
+      return replyWith(msg, `🦸 ${tag}, tu campeón obligatorio de hoy es *${pick(CHAMPS)}*. Sin cambios, sin llorar. 😤`, [contact]);
+    },
+  },
+  {
+    key: 'tilt', aliases: ['!tilt'],
+    run: async ({ msg, who }) => {
+      const { contact, tag } = await mentionOf(msg, who);
+      const n = randInt(0, 100);
+      const frase = n < 25 ? 'Zen total. Pareces monje. 🧘'
+        : n < 50 ? 'Aguantas, pero ya te tembló el dedo. 😅'
+        : n < 75 ? 'Estás a una muerte de escribir "gg report". 😬'
+        : n < 95 ? 'Ya culpaste al ping, al equipo y a tu celular. 📱🔥'
+        : 'Desinstalando el juego en 3, 2, 1... 💀';
+      return replyWith(msg, `😡 Nivel de tilt de ${tag}: *${n}%*\n${frase}`, [contact]);
+    },
+  },
+  {
+    key: 'excusa', aliases: ['!excusa'],
+    run: async ({ msg }) => replyWith(msg, `📝 *Excusa oficial:*\n${pick(EXCUSAS)}`),
+  },
+  {
+    key: 'duo', aliases: ['!duo'],
+    run: async ({ msg, who, isGroupMsg }) => {
+      if (!isGroupMsg) return replyWith(msg, '👥 Este comando solo funciona en grupos.');
+      const info = await getGroupInfo(msg);
+      if (!info) return replyWith(msg, '⚠️ No pude leer los miembros del grupo, intenta en un minuto.');
+
+      // Candidatos: todos menos quien escribe y el propio bot (se compara por ID y por teléfono)
+      const me = String(msg.author || '');
+      const myPhone = toBase10(await senderFullNumber(msg));
+      const botSer = client.info?.wid?._serialized || '';
+      const botPhone = toBase10(client.info?.wid?.user || '');
+      const phoneOf = p => toBase10(p.pn ? digitsOf(p.pn) : (p.id.server === 'c.us' ? digitsOf(p.id.user) : (lidCache.get(p.id._serialized) || '')));
+      const candidatos = info.parts.filter(p => {
+        const id = p.id._serialized;
+        const ph = phoneOf(p);
+        if (id === me || id === botSer) return false;
+        if (ph && (ph === myPhone || ph === botPhone)) return false;
+        return true;
+      });
+      if (!candidatos.length) return replyWith(msg, '😅 No encontré con quién emparejarte.');
+
+      // getContactById puede fallar con algunos IDs: probamos hasta 5 candidatos al azar
+      const orden = [...candidatos].sort(() => Math.random() - 0.5).slice(0, 5);
+      let otro = null;
+      for (const cand of orden) {
+        try { otro = await client.getContactById(cand.id._serialized); if (otro) break; } catch (_) { /* siguiente */ }
+      }
+      if (!otro) return replyWith(msg, '⚠️ No pude elegir a tu pareja de dúo, intenta de nuevo.');
+
+      const { contact: yo, tag: tagYo } = await mentionOf(msg, who);
+      return replyWith(msg, `💞 Tu dúo de hoy: ${tagYo} + @${otro.id.user}\n🤝 Compatibilidad: *${randInt(0, 100)}%*`, [yo, otro]);
+    },
+  },
+];
+
+// Texto de ayuda: indica QUIÉN puede usar cada comando (según la configuración actual)
+function helpText() {
+  const adminWho = ALLOW_GROUP_ADMINS ? 'owner, admins de la lista y admins del grupo' : 'owner y admins de la lista';
+  const guildWho = PUBLIC_COMMANDS ? 'todos' : adminWho;
+  return `📜 *Comandos de ${BOT_NAME}*
+
+🔒 *Administración* — ${adminWho}
+• \`!skibot\` — estado del bot
+• \`!encuesta roles\` — encuesta de líneas en el grupo
+• \`!encuesta\` — crear encuesta de evento (por mensaje directo, *solo owner*)
+
+🛡️ *Gremio* — ${guildWho}
+• \`!iniciales gremio\` — iniciales del gremio
+• \`!link gremio\` — enlace para unirse
+• \`!discord gremio\` — servidor de Discord
+• \`Consultar hora 15:30\` — tu hora local convertida al grupo
+• \`Consultar hora 15:30 🇦🇷\` — hora de otro país
+• \`!comandos\` — esta lista
+• \`!id\` — tu ID de WhatsApp
+
+🎮 *Diversión* — todos
+• \`!me mide\` · \`!rol\` · \`!campeon\` · \`!tilt\` · \`!excusa\`
+• \`!duo\` — tu pareja de dúo del día (solo en grupos)`;
+}
+
 // ================== Handler de mensajes ==================
 client.on('message', async msg => {
   try {
@@ -654,102 +825,19 @@ client.on('message', async msg => {
     const senderId = msg.author || msg.from;
     const preview = rawBody.replace(/\s+/g, ' ').slice(0, 60);
 
-    // ============ Comandos PÚBLICOS (cualquiera, sin control de acceso) ============
-    // Van ANTES del control de acceso, así que los puede usar todo el mundo.
-    if (!inFlow && /^!me mide$/.test(normCmd(rawBody))) {
-      if (onCooldown(msg, 'memide')) return;
-      try {
-        const contact = await msg.getContact();
-        const randomCm = Math.floor(Math.random() * 40) + 1; // 1 a 40
-
-        const responseText = randomCm > 30
-          ? `⚡ @${contact.id.user} ¡¡NO LE CABE EN EL PANTALÓN DE TANTO PODER!! 😱💥🔥\n\n🍆 Tiene *${randomCm} cm DE PODER* 📐🚀`
-          : `📏 A @${contact.id.user} le mide *${randomCm} cm DE PODER* ⚡😏✨`;
-
-        await msg.reply(responseText, undefined, { mentions: [contact] });
-        console.log(`📏 !me mide → ${who} (${randomCm} cm)`);
-      } catch (error) {
-        console.error('Error en comando !me mide:', shortErr(error));
+    // ============ Comandos de diversión (PÚBLICOS: cualquiera, sin control de acceso) ============
+    if (!inFlow) {
+      const fun = FUN_COMMANDS.find(c => isCmd(rawBody, c.aliases));
+      if (fun) {
+        console.log(`🎮 [público] ${who} | ID: ${senderId} | ${isGroupMsg ? 'grupo ' + msg.from : 'DM'} | "${preview}"`);
+        if (onCooldown(msg, fun.key)) return;
+        try {
+          await fun.run({ msg, who, isGroupMsg });
+        } catch (e) {
+          console.error(`❌ Error en ${fun.aliases[0]}:`, shortErr(e));
+        }
+        return;
       }
-      return;
-    }
-    
-        // ============ Comandos divertidos ============
-    const pick = arr => arr[Math.floor(Math.random() * arr.length)];
-
-    // !rol
-    if (isCmd(rawBody, ['!rol', '!linea'])) {
-      if (onCooldown(msg, 'rol')) return;
-      const contact = await msg.getContact();
-      const roles = [
-        '🗡️ *Top*: 1v1 eterno, nadie te va a ayudar.',
-        '🐊 *Jungla*: ganks o llorar.',
-        '🧙‍♂️ *Mid*: la línea de los que se creen protagonistas.',
-        '🏹 *ADC*: mucho daño, cero vida. Reza por tu soporte.',
-        '🛡️ *Soporte*: ver todo el mapa y que nadie te agradezca.',
-      ];
-      return msg.reply(`🎲 @${contact.id.user} hoy te toca:\n\n${pick(roles)}`, undefined, { mentions: [contact] });
-    }
-
-    // !campeon
-    if (isCmd(rawBody, ['!campeon', '!champ'])) {
-      if (onCooldown(msg, 'campeon')) return;
-      const contact = await msg.getContact();
-      const champs = ['Yasuo', 'Teemo', 'Lux', 'Jinx', 'Garen', 'Lee Sin', 'Ahri', 'Vayne', 'Yuumi', 'Darius', 'Ezreal', 'Blitzcrank', 'Kayn', 'Akali', 'Soraka', 'Zed'];
-      return msg.reply(`🦸 @${contact.id.user}, tu campeón obligatorio de hoy es *${pick(champs)}*. Sin cambios, sin llorar. 😤`, undefined, { mentions: [contact] });
-    }
-
-    // !tilt
-    if (isCmd(rawBody, ['!tilt'])) {
-      if (onCooldown(msg, 'tilt')) return;
-      const contact = await msg.getContact();
-      const n = Math.floor(Math.random() * 101);
-      const frase = n < 25 ? 'Zen total. Pareces monje. 🧘'
-        : n < 50 ? 'Aguantas, pero ya te tembló el dedo. 😅'
-        : n < 75 ? 'Estás a una muerte de escribir "gg report". 😬'
-        : n < 95 ? 'Ya culpaste al ping, al equipo y a tu celular. 📱🔥'
-        : 'Desinstalando el juego en 3, 2, 1... 💀';
-      return msg.reply(`😡 Nivel de tilt de @${contact.id.user}: *${n}%*\n${frase}`, undefined, { mentions: [contact] });
-    }
-
-    // !excusa
-    if (isCmd(rawBody, ['!excusa'])) {
-      if (onCooldown(msg, 'excusa')) return;
-      const excusas = [
-        'Se me congeló el celular justo en la pelea. 🥶',
-        'Mi equipo no sabía jugar, yo estaba carreando. 🙄',
-        'El ping estaba en 999 y nadie me cree. 📶',
-        'Iba ganando línea, pero el jungla nunca apareció. 🐊',
-        'Mi gato pisó la pantalla. 🐱',
-        'Estaba probando una build experimental. 🧪',
-        'Me dio sueño en el minuto 12. 😴',
-      ];
-      return msg.reply(`📝 *Excusa oficial:*\n${pick(excusas)}`);
-    }
-
-    // !duo (solo en grupos)
-    if (isCmd(rawBody, ['!duo'])) {
-      if (!isGroupMsg) return;
-      if (onCooldown(msg, 'duo')) return;
-      const info = await getGroupInfo(msg);
-      if (!info) return msg.reply('⚠️ No pude leer los miembros del grupo, intenta en un minuto.');
-      const me = String(msg.author || '');
-      const candidatos = info.parts
-        .map(p => p.id._serialized)
-        .filter(id => id !== me && id !== client.info?.wid?._serialized);
-      if (!candidatos.length) return;
-      try {
-        const yo = await msg.getContact();
-        const otro = await client.getContactById(pick(candidatos));
-        const porcentaje = Math.floor(Math.random() * 101);
-        return msg.reply(
-          `💞 Tu dúo de hoy: @${yo.id.user} + @${otro.id.user}\n🤝 Compatibilidad: *${porcentaje}%*`,
-          undefined, { mentions: [yo, otro] }
-        );
-      } catch (e) {
-        console.error('Error en !duo:', shortErr(e));
-      }
-      return;
     }
 
     // ============ Control de acceso (solo para comandos) ============
@@ -913,29 +1001,7 @@ client.on('message', async msg => {
     // ============ !comandos ============
     if (isCmd(rawBody, ['!comandos', '!cmd', '!comando'])) {
       if (onCooldown(msg, 'help')) return;
-      await msg.reply(`
-📜 *Lista de Comandos disponibles* ⚙️
-
-1. *Iniciales del Gremio* ⚔️
-   ➤ Comando: \`!iniciales gremio\`
-
-2. *Enlace para unirse al Gremio* 🛡️
-   ➤ Comando: \`!link gremio\`
-
-3. *Servidor de Discord del Gremio* 💬
-   ➤ Comando: \`!discord gremio\`
-
-4. *Conversión Horaria para el Grupo* 🕒
-   ➤ Tu hora local: \`Consultar hora 15:30\`
-   ➤ Hora de otro país: \`Consultar hora 15:30 🇦🇷\`
-
-5. *Encuesta de Roles (solo admins)* 📊
-   ➤ Comando: \`!encuesta roles\`
-
-6. *¿Cuánto te mide? (para todos)* 📏
-   ➤ Comando: \`!me mide\`
-
-ℹ️ Puedes escribir *!comandos*, *!cmd* o *!comando* para ver esta lista.`);
+      await msg.reply(helpText());
       return;
     }
 
@@ -1129,6 +1195,7 @@ console.log('⚙️ Config → ' + [
   `admins por número=[${[...ADMIN_NUMBERS].map(mask).join(', ')}]`,
   `PUBLIC_COMMANDS=${PUBLIC_COMMANDS}`,
   `ALLOW_GROUP_ADMINS=${ALLOW_GROUP_ADMINS}`,
+  `RESTART_EVERY_HOURS=${RESTART_EVERY_HOURS}`,
 ].join(' | '));
 if (!OWNER_IDS.size && !ADMIN_IDS.size) {
   console.warn('⚠️ OWNER_IDS y ADMIN_IDS están VACÍOS. Si ya las definiste en Portainer, tu docker-compose no las pasa al contenedor: agrega en "environment" las líneas  - OWNER_IDS=${OWNER_IDS:-}  y  - ADMIN_IDS=${ADMIN_IDS:-}');

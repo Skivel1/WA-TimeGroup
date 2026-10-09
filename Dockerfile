@@ -1,9 +1,8 @@
 FROM node:20-bookworm-slim
 
 # Chromium del sistema + fuentes (sin fuente de emojis, los emojis salen rotos)
-# git: necesario para instalar whatsapp-web.js desde GitHub
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium fonts-liberation fonts-noto-color-emoji tzdata ca-certificates git \
+      chromium fonts-liberation fonts-noto-color-emoji tzdata ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
@@ -14,9 +13,11 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true \
     DATA_DIR=/app/data
 
 WORKDIR /app
-COPY package.json ./
-# npm install (no npm ci): el package-lock.json viejo fijaba la versión anterior de la librería
-RUN npm install --omit=dev && npm cache clean --force
+
+COPY package*.json ./
+# Con package-lock.json instala versiones exactas (npm ci); sin él, instala según package.json
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi \
+    && npm cache clean --force
 
 COPY index.js ./
 
